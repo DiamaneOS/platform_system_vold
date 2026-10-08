@@ -28,9 +28,13 @@ namespace ext4 {
 bool IsSupported();
 
 status_t Check(const std::string& source, const std::string& target);
+// DiamaneOS: full forced check of removable media before any kernel mount, in the untrusted fsck
+// domain, preen only (safe repairs); returns e2fsck's exit status or a negative errno.
+status_t CheckUntrusted(const std::string& source);
 status_t Mount(const std::string& source, const std::string& target, bool ro, bool remount,
-               bool executable);
-status_t Format(const std::string& source, unsigned long numSectors, const std::string& target);
+               bool executable, const std::string& data = "");
+status_t Format(const std::string& source, unsigned long numSectors, const std::string& target,
+                bool checksums = false);
 status_t Resize(const std::string& source, unsigned long numSectors);
 
 }  // namespace ext4

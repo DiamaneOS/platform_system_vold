@@ -39,14 +39,9 @@
 #include <thread>
 
 using android::base::StringPrintf;
-using android::vold::IsVirtioBlkDevice;
 
 namespace android {
 namespace vold {
-
-static const unsigned int kMajorBlockLoop = 7;
-static const unsigned int kMajorBlockHdd = 8;
-static const unsigned int kMajorBlockMmc = 179;
 
 PrivateVolume::PrivateVolume(dev_t device, const KeyBuffer& keyRaw)
     : VolumeBase(Type::kPrivate), mRawDevice(device), mKeyRaw(keyRaw) {
@@ -133,15 +128,31 @@ status_t PrivateVolume::doMount() {
     }
 
     if (mFsType == "ext4") {
-        int res = ext4::Check(mDmDevPath, mPath);
+        // DiamaneOS: the card is removable and its contents are only confidential, not
+        // authenticated, so check it fully before the kernel parses it, in the untrusted fsck
+        // domain (which can reach only vold's own device nodes), with safe repairs only.
+        struct stat st;
+        if (stat(mDmDevPath.c_str(), &st) != 0 || !S_ISBLK(st.st_mode)) {
+            PLOG(ERROR) << getId() << " cannot stat " << mDmDevPath;
+            return -EIO;
+        }
+        std::string checkNode = StringPrintf("/dev/block/vold/private_fsck:%u,%u",
+                                             major(st.st_rdev), minor(st.st_rdev));
+        if (CreateDeviceNode(checkNode, st.st_rdev)) {
+            PLOG(ERROR) << getId() << " cannot create " << checkNode;
+            return -EIO;
+        }
+        int res = ext4::CheckUntrusted(checkNode);
+        DestroyDeviceNode(checkNode);
         if (res == 0 || res == 1) {
             LOG(DEBUG) << getId() << " passed filesystem check";
         } else {
-            PLOG(ERROR) << getId() << " failed filesystem check";
+            LOG(ERROR) << getId() << " failed filesystem check: " << res;
             return -EIO;
         }
 
-        if (ext4::Mount(mDmDevPath, mPath, false, false, true)) {
+        // No executables on the card (apps stay internal); a later error makes it read-only.
+        if (ext4::Mount(mDmDevPath, mPath, false, false, false, "errors=remount-ro")) {
             PLOG(ERROR) << getId() << " failed to mount";
             return -EIO;
         }
@@ -215,23 +226,15 @@ status_t PrivateVolume::doUnmount() {
 status_t PrivateVolume::doFormat(const std::string& fsType) {
     std::string resolvedFsType = fsType;
     if (fsType == "auto") {
-        // For now, assume that all MMC devices are flash-based SD cards, and
-        // give everyone else ext4 because sysfs rotational isn't reliable.
-        // Additionally, prefer f2fs for loop-based devices
-        if ((major(mRawDevice) == kMajorBlockMmc ||
-             major(mRawDevice) == kMajorBlockHdd ||
-             major(mRawDevice) == kMajorBlockLoop ||
-             IsVirtioBlkDevice(major(mRawDevice))) && f2fs::IsSupported()) {
-            resolvedFsType = "f2fs";
-        } else {
-            resolvedFsType = "ext4";
-        }
+        // DiamaneOS: always ext4 with metadata checksums. f2fs is not safe on removable media
+        // (no inode checksums, its checker only scans images marked dirty).
+        resolvedFsType = "ext4";
         LOG(DEBUG) << "Resolved auto to " << resolvedFsType;
     }
 
     if (resolvedFsType == "ext4") {
         // TODO: change reported mountpoint once we have better selinux support
-        if (ext4::Format(mDmDevPath, 0, "/data")) {
+        if (ext4::Format(mDmDevPath, 0, "/data", true)) {
             PLOG(ERROR) << getId() << " failed to format";
             return -EIO;
         }
