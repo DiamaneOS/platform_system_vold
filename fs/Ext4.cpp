@@ -121,8 +121,18 @@ status_t Check(const std::string& source, const std::string& target) {
     return 0;
 }
 
+status_t CheckUntrusted(const std::string& source) {
+    if (access(kFsckPath, X_OK)) {
+        LOG(ERROR) << kFsckPath << " missing: refusing to mount " << source << " unchecked";
+        return -ENOENT;
+    }
+    std::vector<std::string> cmd = {kFsckPath, "-f", "-p", source};
+    LOG(DEBUG) << "Running " << kFsckPath << " -f -p on " << source;
+    return ForkExecvpTimeout(cmd, std::chrono::minutes(10), sFsckUntrustedContext);
+}
+
 status_t Mount(const std::string& source, const std::string& target, bool ro, bool remount,
-               bool executable) {
+               bool executable, const std::string& data) {
     int rc;
     unsigned long flags;
 
@@ -135,12 +145,13 @@ status_t Mount(const std::string& source, const std::string& target, bool ro, bo
     flags |= (ro ? MS_RDONLY : 0);
     flags |= (remount ? MS_REMOUNT : 0);
 
-    rc = mount(c_source, c_target, "ext4", flags, NULL);
+    const char* c_data = data.empty() ? NULL : data.c_str();
+    rc = mount(c_source, c_target, "ext4", flags, c_data);
 
     if (rc && errno == EROFS) {
         LOG(ERROR) << source << " appears to be a read only filesystem - retrying mount RO";
         flags |= MS_RDONLY;
-        rc = mount(c_source, c_target, "ext4", flags, NULL);
+        rc = mount(c_source, c_target, "ext4", flags, c_data);
     }
 
     return rc;
@@ -156,7 +167,8 @@ status_t Resize(const std::string& source, unsigned long numSectors) {
     return ForkExecvp(cmd);
 }
 
-status_t Format(const std::string& source, unsigned long numSectors, const std::string& target) {
+status_t Format(const std::string& source, unsigned long numSectors, const std::string& target,
+                bool checksums) {
     std::vector<std::string> cmd;
     cmd.push_back(kMkfsPath);
 
@@ -187,6 +199,10 @@ status_t Format(const std::string& source, unsigned long numSectors, const std::
     }
     if (needs_casefold) {
         options += ",casefold";
+    }
+    if (checksums) {
+        // DiamaneOS: metadata (and journal) checksums for adopted microSD cards.
+        options += ",metadata_csum,64bit";
     }
 
     cmd.push_back("-O");

@@ -265,9 +265,15 @@ binder::Status VoldNativeService::partition(const std::string& diskId, int32_t p
         case PARTITION_TYPE_PUBLIC:
             return translate(disk->partitionPublic());
         case PARTITION_TYPE_PRIVATE:
-            return translate(disk->partitionPrivate());
         case PARTITION_TYPE_MIXED:
-            return translate(disk->partitionMixed(ratio));
+            // DiamaneOS: during an update trial boot /data writes roll back on failure, which
+            // would drop the new volume key and orphan the card.
+            if (cp_needsCheckpoint()) {
+                return error("Cannot adopt storage before the update is committed");
+            }
+            return translate(partitionType == PARTITION_TYPE_PRIVATE
+                                     ? disk->partitionPrivate()
+                                     : disk->partitionMixed(ratio));
         default:
             return error("Unknown type " + std::to_string(partitionType));
     }
