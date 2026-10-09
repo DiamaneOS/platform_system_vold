@@ -360,7 +360,8 @@ bool VolumeManager::forgetPartition(const std::string& partGuid, const std::stri
     if (!android::vold::runSecdiscardSingle(keyPath)) {
         LOG(WARNING) << "secdiscard of " << keyPath << " failed";
     }
-    if (unlink(keyPath.c_str()) != 0) {
+    // secdiscard unlinks the file itself. Only a file that is still there is an error.
+    if (unlink(keyPath.c_str()) != 0 && errno != ENOENT) {
         LOG(ERROR) << "Failed to unlink " << keyPath;
         return false;
     }
