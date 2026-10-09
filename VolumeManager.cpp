@@ -60,6 +60,7 @@
 #include "Loop.h"
 #include "NetlinkManager.h"
 #include "Process.h"
+#include "KeyStorage.h"
 #include "Utils.h"
 #include "VoldNativeService.h"
 #include "VoldUtil.h"
@@ -355,7 +356,12 @@ bool VolumeManager::forgetPartition(const std::string& partGuid, const std::stri
     }
 
     std::string keyPath = android::vold::BuildKeyPath(normalizedGuid);
-    if (unlink(keyPath.c_str()) != 0) {
+    // DiamaneOS: discard the key's blocks before unlinking, as for other vold keys.
+    if (!android::vold::runSecdiscardSingle(keyPath)) {
+        LOG(WARNING) << "secdiscard of " << keyPath << " failed";
+    }
+    // secdiscard unlinks the file itself. Only a file that is still there is an error.
+    if (unlink(keyPath.c_str()) != 0 && errno != ENOENT) {
         LOG(ERROR) << "Failed to unlink " << keyPath;
         return false;
     }
