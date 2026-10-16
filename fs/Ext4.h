@@ -29,7 +29,7 @@ bool IsSupported();
 
 status_t Check(const std::string& source, const std::string& target);
 // DiamaneOS: full forced check of removable media before any kernel mount, in the untrusted fsck
-// domain, preen only (safe repairs); returns e2fsck's exit status or a negative errno.
+// domain, preen only (safe repairs). Returns e2fsck's exit status or a negative errno.
 status_t CheckUntrusted(const std::string& source);
 status_t Mount(const std::string& source, const std::string& target, bool ro, bool remount,
                bool executable, const std::string& data = "");

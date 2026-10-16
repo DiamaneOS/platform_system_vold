@@ -66,7 +66,7 @@ status_t PrivateVolume::readMetadata() {
 }
 
 // DiamaneOS: after an unmount, other mount namespaces can keep the card's dm device busy for a
-// while (b/149396179); with AOSP's one second of retries a storage reset left the card unmountable.
+// while (b/149396179). With AOSP's one second of retries a storage reset left the card unmountable.
 // Wait up to ten seconds, and name the processes that still have it mounted if it stays busy.
 static void LogDmDeviceHolders(const std::string& name) {
     std::string path;
@@ -178,7 +178,7 @@ status_t PrivateVolume::doMount() {
             return -EIO;
         }
 
-        // No executables on the card (apps stay internal); a later error makes it read-only.
+        // No executables on the card (apps stay internal). A later error makes it read-only.
         if (ext4::Mount(mDmDevPath, mPath, false, false, false, "errors=remount-ro")) {
             PLOG(ERROR) << getId() << " failed to mount";
             return -EIO;
