@@ -42,7 +42,7 @@ class Disk {
     virtual ~Disk();
 
     enum Flags {
-        /* DiamaneOS: flag that disk is adoptable (the FP6's microSD slot, fstab encryptable=) */
+        /* DiamaneOS: flag that disk is adoptable (a microSD slot marked encryptable= in the fstab) */
         kAdoptable = 1 << 0,
         /* Flag that disk is considered primary when the user hasn't
          * explicitly picked a primary storage location */

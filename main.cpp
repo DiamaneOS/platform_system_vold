@@ -278,8 +278,8 @@ static int process_config(VolumeManager* vm, VoldConfigs* configs) {
             int flags = 0;
 
             if (entry.is_encryptable()) {
-                // DiamaneOS: encrypted microSD. GrapheneOS removed adoption (f51adc0820c0) as no
-                // Pixel has a card slot; the FP6 has one. The virtual disk stays non-adoptable.
+                // DiamaneOS: encrypted microSD adoption, which GrapheneOS removed (f51adc0820c0)
+                // as no Pixel has a card slot. The virtual disk stays non-adoptable.
                 flags |= android::vold::Disk::Flags::kAdoptable;
                 configs->has_adoptable = true;
             }
