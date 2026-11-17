@@ -83,6 +83,8 @@ class VolumeBase {
         kUnmountable,
         kRemoved,
         kBadRemoval,
+        /* DiamaneOS: the filesystem VM could not open it (IVold VOLUME_STATE_UNOPENABLE) */
+        kUnopenable,
     };
 
     const std::string& getId() const { return mId; }
@@ -132,6 +134,8 @@ class VolumeBase {
     virtual void doPostMount();
     virtual status_t doUnmount() = 0;
     virtual status_t doFormat(const std::string& fsType);
+    /* DiamaneOS: whether the last failed mount failed in the filesystem VM (state kUnopenable) */
+    virtual bool mountFailedInVm() const { return false; }
 
     status_t setId(const std::string& id);
     status_t setPath(const std::string& path);

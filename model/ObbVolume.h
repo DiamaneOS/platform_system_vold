@@ -44,6 +44,9 @@ class ObbVolume : public VolumeBase {
 
     std::string mLoopPath;
 
+    /* DiamaneOS: fsvmd serving the image from the filesystem VM, or -1 */
+    pid_t mFsvmdPid = -1;
+
     DISALLOW_COPY_AND_ASSIGN(ObbVolume);
 };
 

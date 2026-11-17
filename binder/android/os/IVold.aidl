@@ -184,6 +184,8 @@ interface IVold {
     const int VOLUME_STATE_UNMOUNTABLE = 6;
     const int VOLUME_STATE_REMOVED = 7;
     const int VOLUME_STATE_BAD_REMOVAL = 8;
+    // DiamaneOS: the filesystem VM could not open the volume. Not "unmountable": nothing says it is corrupted.
+    const int VOLUME_STATE_UNOPENABLE = 9;
 
     const int VOLUME_TYPE_PUBLIC = 0;
     const int VOLUME_TYPE_PRIVATE = 1;

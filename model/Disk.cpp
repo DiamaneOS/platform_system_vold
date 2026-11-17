@@ -34,6 +34,9 @@
 
 #include <fcntl.h>
 #include <inttypes.h>
+#include <chrono>
+#include <mutex>
+#include <thread>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mount.h>
@@ -233,6 +236,149 @@ void Disk::destroyAllVolumes() {
         vol->destroy();
     }
     mVolumes.clear();
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    removeAddedPartitions();
+#endif
+}
+
+bool Disk::isVmDisk() const {
+    unsigned int m = major(mDevice);
+    // clang-format off
+    switch (m) {
+        case kMajorBlockMmc:
+        case kMajorBlockScsiA: case kMajorBlockScsiB: case kMajorBlockScsiC:
+        case kMajorBlockScsiD: case kMajorBlockScsiE: case kMajorBlockScsiF:
+        case kMajorBlockScsiG: case kMajorBlockScsiH: case kMajorBlockScsiI:
+        case kMajorBlockScsiJ: case kMajorBlockScsiK: case kMajorBlockScsiL:
+        case kMajorBlockScsiM: case kMajorBlockScsiN: case kMajorBlockScsiO:
+        case kMajorBlockScsiP:
+            return true;
+        default:
+            return false;
+    }
+    // clang-format on
+}
+
+void Disk::removeAddedPartitions() {
+    for (uint32_t index : mAddedPartitions) {
+        fsvm::DeletePartition(mDevPath, index);
+    }
+    mAddedPartitions.clear();
+}
+
+void Disk::createPublicVolumeInVm(const fsvm::Part& part) {
+    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(mDevice, mDevPath, mSysPath, mSize, part));
+    if (mJustPartitioned) {
+        LOG(DEBUG) << "Device just partitioned; silently formatting";
+        vol->setSilent(true);
+        vol->create();
+        vol->format("auto");
+        vol->destroy();
+        vol->setSilent(false);
+    }
+
+    mVolumes.push_back(vol);
+    vol->setDiskId(getId());
+    vol->create();
+}
+
+bool Disk::createPrivateVolumeInVm(const fsvm::Part& part) {
+    // Adoptable storage: only a card this phone adopted has a key for its partition GUID. Without one, nothing is
+    // added to Android's kernel.
+    std::string normalizedGuid;
+    std::string keyRaw;
+    if (NormalizeHex(part.partGuid, normalizedGuid) ||
+        !ReadFileToString(BuildKeyPath(normalizedGuid), &keyRaw)) {
+        LOG(WARNING) << mId << ": no key for the adoptable storage partition " << part.partGuid;
+        return true;
+    }
+    dev_t partDevice;
+    bool added = false;
+    if (fsvm::AddPartition(mDevPath, mSysPath, part, &partDevice, &added) != OK) {
+        LOG(ERROR) << mId << ": could not add the adoptable storage partition";
+        return false;
+    }
+    if (added) mAddedPartitions.push_back(part.index);
+    createPrivateVolume(partDevice, part.partGuid);
+    return true;
+}
+
+void Disk::createUnopenableVolume() {
+    // Not "unsupported, format it?": one volume that cannot be opened, and says so.
+    mJustPartitioned = false;
+    fsvm::Part whole;
+    whole.length = mSize / 512;
+    createPublicVolumeInVm(whole);
+}
+
+void Disk::reprobeInVm() {
+    // Only while the disk still shows the result of a failed probe, and nothing is mounted from it.
+    if (!mProbeFailed) return;
+    for (const auto& vol : mVolumes) {
+        if (vol->getState() == VolumeBase::State::kMounted) return;
+    }
+    LOG(INFO) << mId << ": reading the partition table again";
+    readPartitions();
+}
+
+static void ScheduleReprobe(const std::string& diskId, int delaySeconds) {
+    std::thread([diskId, delaySeconds] {
+        std::this_thread::sleep_for(std::chrono::seconds(delaySeconds));
+        std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
+        auto disk = VolumeManager::Instance()->findDisk(diskId);
+        if (disk) disk->reprobeInVm();
+    }).detach();
+}
+
+status_t Disk::readPartitionsInVm(int maxMinors) {
+    destroyAllVolumes();
+
+    // No medium (an empty slot in a USB card reader): nothing to read, as when sgdisk failed before.
+    if (mSize == static_cast<uint64_t>(-1) || mSize < 512) {
+        LOG(WARNING) << mId << " has no medium";
+        auto listener = VolumeManager::Instance()->getListener();
+        if (listener) listener->onDiskScanned(getId());
+        mJustPartitioned = false;
+        return OK;
+    }
+
+    // Android's kernel did not read the table and sgdisk does not either: the filesystem VM does. Partitions vold
+    // added before, or a kernel without the option made, go first.
+    fsvm::Layout layout;
+    mProbeFailed = fsvm::DeleteAllPartitions(mDevPath, mSysPath) != OK ||
+                   fsvm::Probe(mDevPath, mSize, &layout) != OK;
+    if (mProbeFailed) {
+        LOG(ERROR) << mId << ": the filesystem VM could not read the disk";
+        createUnopenableVolume();
+        // A protected VM start can be refused for a while after boot: try twice more, later.
+        if (++mProbeFailures <= 2) ScheduleReprobe(getId(), mProbeFailures == 1 ? 15 : 60);
+    } else {
+        mProbeFailures = 0;
+        for (const auto& part : layout.parts) {
+            switch (part.cls) {
+                case fsvm::Part::Class::kPublic:
+                    if (part.index > static_cast<uint32_t>(maxMinors)) {
+                        LOG(WARNING) << mId << ": partition " << part.index << " is beyond " << maxMinors;
+                        break;
+                    }
+                    createPublicVolumeInVm(part);
+                    break;
+                case fsvm::Part::Class::kExpand:
+                    // This phone's adoptable storage that could not be added must not look unsupported (and
+                    // offered for formatting): it shows as a card that could not be opened.
+                    if (!createPrivateVolumeInVm(part)) createUnopenableVolume();
+                    break;
+                case fsvm::Part::Class::kMeta:
+                    break;
+            }
+        }
+    }
+
+    auto listener = VolumeManager::Instance()->getListener();
+    if (listener) listener->onDiskScanned(getId());
+
+    mJustPartitioned = false;
+    return OK;
 }
 
 status_t Disk::readMetadata() {
@@ -326,6 +472,12 @@ status_t Disk::readPartitions() {
     if (maxMinors < 0) {
         return -ENOTSUP;
     }
+
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    if (isVmDisk()) {
+        return readPartitionsInVm(maxMinors);
+    }
+#endif
 
     destroyAllVolumes();
 
@@ -449,6 +601,14 @@ status_t Disk::partitionPublic() {
     destroyAllVolumes();
     mJustPartitioned = true;
 
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // sgdisk below writes the new table. Zeroing the old one first means it never reads a table from the card.
+    if (isVmDisk() && fsvm::ZeroTables(mDevPath, mSize) != OK) {
+        LOG(ERROR) << "Failed to clear the old partition table";
+        return -EIO;
+    }
+#endif
+
     // First nuke any existing partition table
     std::vector<std::string> cmd;
     cmd.push_back(kSgdiskPath);
@@ -475,6 +635,10 @@ status_t Disk::partitionPublic() {
         return res;
     }
 
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // Android's kernel does not reread a table it never read. The VM reads the new one, and the volumes come from it.
+    if (isVmDisk()) return readPartitions();
+#endif
     return OK;
 }
 
@@ -487,6 +651,14 @@ status_t Disk::partitionMixed(int8_t ratio) {
 
     destroyAllVolumes();
     mJustPartitioned = true;
+
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // sgdisk below writes the new table. Zeroing the old one first means it never reads a table from the card.
+    if (isVmDisk() && fsvm::ZeroTables(mDevPath, mSize) != OK) {
+        LOG(ERROR) << "Failed to clear the old partition table";
+        return -EIO;
+    }
+#endif
 
     // First nuke any existing partition table
     std::vector<std::string> cmd;
@@ -564,6 +736,9 @@ status_t Disk::partitionMixed(int8_t ratio) {
         return res;
     }
 
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    if (isVmDisk()) return readPartitions();
+#endif
     return OK;
 }
 

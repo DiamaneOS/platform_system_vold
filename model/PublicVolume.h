@@ -18,6 +18,7 @@
 #define ANDROID_VOLD_PUBLIC_VOLUME_H
 
 #include "VolumeBase.h"
+#include "fs/Fsvm.h"
 
 #include <cutils/multiuser.h>
 
@@ -40,6 +41,9 @@ namespace vold {
 class PublicVolume : public VolumeBase {
   public:
     explicit PublicVolume(dev_t device);
+    /* DiamaneOS: a partition the filesystem VM read from the whole disk `diskDevice` (phase 2) */
+    PublicVolume(dev_t diskDevice, const std::string& diskDevPath, const std::string& diskSysPath,
+                 uint64_t diskBytes, const fsvm::Part& part);
     virtual ~PublicVolume();
 
     status_t bindMountForUser(userid_t user_id);
@@ -54,6 +58,13 @@ class PublicVolume : public VolumeBase {
 
     status_t readMetadata();
     status_t initAsecStage();
+
+    bool mountFailedInVm() const override { return mVmFailed; }
+    status_t checkInVm();
+    status_t mountInVm(gid_t gid);
+    status_t formatInVm(const std::string& fsType);
+    status_t addTempPartition(std::string* path);
+    void removeTempPartition();
 
   private:
     /* Kernel device representing partition */
@@ -83,6 +94,18 @@ class PublicVolume : public VolumeBase {
 
     /* fsvmd serving this volume from a protected VM, or -1 */
     pid_t mFsvmdPid = -1;
+
+    /* DiamaneOS phase 2: the partition the VM read, on the whole disk at mDiskDevPath */
+    bool mInVm = false;
+    fsvm::Part mPart;
+    std::string mDiskDevPath;
+    std::string mDiskSysPath;
+    uint64_t mDiskBytes = 0;
+    /* Set when the last mount failed in the filesystem VM */
+    bool mVmFailed = false;
+    /* A partition device added for fsck or format, removed again afterwards */
+    std::string mTempNode;
+    bool mTempAdded = false;
 
     DISALLOW_COPY_AND_ASSIGN(PublicVolume);
 };

@@ -20,6 +20,7 @@
 #include "StubVolume.h"
 #include "Utils.h"
 #include "VolumeBase.h"
+#include "fs/Fsvm.h"
 
 #include <utils/Errors.h>
 
@@ -120,6 +121,22 @@ class Disk {
     void createPublicVolume(dev_t device);
     void createPrivateVolume(dev_t device, const std::string& partGuid);
     void createStubVolume();
+
+    /* DiamaneOS phase 2: SD cards and USB disks, whose tables only the filesystem VM reads */
+    bool isVmDisk() const;
+    status_t readPartitionsInVm(int maxMinors);
+    void createPublicVolumeInVm(const fsvm::Part& part);
+    bool createPrivateVolumeInVm(const fsvm::Part& part);
+    void createUnopenableVolume();
+    void removeAddedPartitions();
+  public:
+    /* Reads the table again after a failed probe (a protected VM start can be refused for a while after boot) */
+    void reprobeInVm();
+  private:
+    int mProbeFailures = 0;
+    bool mProbeFailed = false;
+    /* Partitions vold added to Android's kernel (adoptable storage) */
+    std::vector<uint32_t> mAddedPartitions;
 
     void destroyAllVolumes();
 

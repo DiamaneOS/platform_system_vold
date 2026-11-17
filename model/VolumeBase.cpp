@@ -224,14 +224,19 @@ status_t VolumeBase::doDestroy() {
 }
 
 status_t VolumeBase::mount() {
-    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+    if ((mState != State::kUnmounted) && (mState != State::kUnmountable) &&
+        (mState != State::kUnopenable)) {
         LOG(WARNING) << getId() << " mount requires state unmounted or unmountable";
         return -EBUSY;
     }
 
     setState(State::kChecking);
     status_t res = doMount();
-    setState(res == OK ? State::kMounted : State::kUnmountable);
+    if (res == OK) {
+        setState(State::kMounted);
+    } else {
+        setState(mountFailedInVm() ? State::kUnopenable : State::kUnmountable);
+    }
 
     if (res == OK) {
         doPostMount();
@@ -265,7 +270,8 @@ status_t VolumeBase::format(const std::string& fsType) {
         unmount();
     }
 
-    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+    if ((mState != State::kUnmounted) && (mState != State::kUnmountable) &&
+        (mState != State::kUnopenable)) {
         LOG(WARNING) << getId() << " format requires state unmounted or unmountable";
         return -EBUSY;
     }
