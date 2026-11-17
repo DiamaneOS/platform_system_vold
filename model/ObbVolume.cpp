@@ -64,6 +64,11 @@ status_t ObbVolume::doDestroy() {
 }
 
 status_t ObbVolume::doMount() {
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // DiamaneOS: an OBB is a FAT image from an app. Android's kernel does not parse FAT images from apps.
+    LOG(ERROR) << getId() << " not mounted: OBB images are not mounted on this build";
+    return -EOPNOTSUPP;
+#endif
     auto path = StringPrintf("/mnt/obb/%s", getId().c_str());
     setPath(path);
 

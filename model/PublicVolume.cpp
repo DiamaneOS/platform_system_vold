@@ -20,6 +20,7 @@
 #include "Utils.h"
 #include "VolumeManager.h"
 #include "fs/Exfat.h"
+#include "fs/Fsvm.h"
 #include "fs/Vfat.h"
 
 #include <android-base/logging.h>
@@ -111,12 +112,22 @@ status_t PublicVolume::doMount() {
     bool isVisible = isVisibleForWrite();
     readMetadata();
 
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // DiamaneOS: only the filesystem VM's kernel parses the volume, so Android's kernel need not support it. The
+    // check below still runs fsck in its own sandbox (fsck_untrusted) first.
+    if (mFsType == "vfat") {
+#else
     if (mFsType == "vfat" && vfat::IsSupported()) {
+#endif
         if (vfat::Check(mDevPath)) {
             LOG(ERROR) << getId() << " failed filesystem check";
             return -EIO;
         }
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    } else if (mFsType == "exfat") {
+#else
     } else if (mFsType == "exfat" && exfat::IsSupported()) {
+#endif
         if (exfat::Check(mDevPath)) {
             LOG(ERROR) << getId() << " failed filesystem check";
             return -EIO;
@@ -147,6 +158,14 @@ status_t PublicVolume::doMount() {
         return -errno;
     }
 
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // DiamaneOS: Android's kernel never mounts a FAT or exFAT volume. fsvmd serves it from a protected VM. If the VM
+    // does not serve it, the volume is not mounted: there is no fallback to the kernel mount.
+    if (fsvm::Mount(mDevPath, mRawPath, isVisible ? AID_MEDIA_RW : AID_EXTERNAL_STORAGE, getId(), &mFsvmdPid)) {
+        LOG(ERROR) << getId() << " was not served by the filesystem VM";
+        return -EIO;
+    }
+#else
     if (mFsType == "vfat") {
         if (vfat::Mount(mDevPath, mRawPath, false, false, false, AID_ROOT,
                         (isVisible ? AID_MEDIA_RW : AID_EXTERNAL_STORAGE), 0007, true)) {
@@ -160,6 +179,7 @@ status_t PublicVolume::doMount() {
             return -EIO;
         }
     }
+#endif
 
     if (getMountFlags() & MountFlags::kPrimary) {
         initAsecStage();
@@ -388,6 +408,11 @@ status_t PublicVolume::doUnmount() {
         umount2(mRawPath.c_str(),MNT_DETACH);
         PLOG(INFO) << "use umount lazy if force unmount fail";
     }
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // The FUSE mount is gone, so fsvmd and its VM can stop.
+    fsvm::Stop(mFsvmdPid);
+    mFsvmdPid = -1;
+#endif
     if(rmdir(mRawPath.c_str()) != 0) {
         PLOG(INFO) << "rmdir mRawPath=" << mRawPath << " fail";
         KillProcessesUsingPath(getPath());

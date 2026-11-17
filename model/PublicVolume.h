@@ -81,6 +81,9 @@ class PublicVolume : public VolumeBase {
     /* User-visible filesystem label */
     std::string mFsLabel;
 
+    /* fsvmd serving this volume from a protected VM, or -1 */
+    pid_t mFsvmdPid = -1;
+
     DISALLOW_COPY_AND_ASSIGN(PublicVolume);
 };
 
