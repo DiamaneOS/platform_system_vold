@@ -71,6 +71,9 @@ TEST(FsvmTest, RefusesAnythingElse) {
             "LAYOUT 1 none 1\nPART 1 public 0 10 vfat - - 0 -\nEND\n",             // numbered whole disk
             "LAYOUT 1 mbr 1\nPART 129 public 2048 10 vfat - - 0 -\nEND\n",         // number too high
             "LAYOUT 1 mbr 1\nPART 1  public 2048 10 vfat - - 0 -\nEND\n",          // double space
+            "LAYOUT 1 mbr 1\nPART +1 public 2048 10 vfat - - 0 -\nEND\n",         // sign
+            "LAYOUT 1 mbr 1\nPART 1 public 0x800 10 vfat - - 0 -\nEND\n",        // hex
+            "LAYOUT 1 mbr  1\nEND\n",                                            // spaces in the count
     };
     for (const char* t : bad) {
         EXPECT_NE(OK, ParseLayout(t, kDisk, &l)) << t;

@@ -27,6 +27,7 @@
 #include <private/android_filesystem_config.h>
 
 #include <android-base/strings.h>
+#include <map>
 #include <android-base/unique_fd.h>
 #include <fcntl.h>
 #include <linux/openat2.h>
@@ -58,29 +59,45 @@ ObbVolume::~ObbVolume() {}
 // read-only. Each mounted OBB holds a VM, so at most a few at a time.
 static int sObbVms = 0;
 static constexpr int kMaxObbVms = 4;
+/* One app cannot take every slot from the others. */
+static std::map<gid_t, int> sObbVmsByOwner;
+static constexpr int kMaxObbVmsPerOwner = 2;
 static constexpr uint64_t kMaxObbBytes = 8ULL << 30;
 
 /* Opens an OBB in /data/media/<user>/Android/obb/, read-only, refusing symlinks and anything outside. */
 static int OpenObb(const std::string& path) {
     static constexpr char kRoot[] = "/data/media/";
     if (!android::base::StartsWith(path, kRoot)) return -EINVAL;
-    auto rest = path.substr(sizeof(kRoot) - 1);
-    auto slash = rest.find('/');
-    if (slash == 0 || slash == std::string::npos ||
-        rest.find_first_not_of("0123456789") != slash ||
-        !android::base::StartsWith(rest.substr(slash), "/Android/obb/")) {
+    // Exactly <user>/Android/obb/<package>/<file>: no other folder, no "." or ".." component, nothing empty.
+    auto parts = android::base::Split(path.substr(sizeof(kRoot) - 1), "/");
+    if (parts.size() != 5 || parts[0].empty() || parts[0].size() > 6 ||
+        parts[0].find_first_not_of("0123456789") != std::string::npos || parts[1] != "Android" ||
+        parts[2] != "obb") {
         return -EINVAL;
+    }
+    for (size_t i = 3; i < parts.size(); i++) {
+        if (parts[i].empty() || parts[i] == "." || parts[i] == ".." || parts[i].size() > 255) return -EINVAL;
     }
     android::base::unique_fd root(TEMP_FAILURE_RETRY(open("/data/media", O_PATH | O_DIRECTORY | O_CLOEXEC)));
     if (root < 0) return -errno;
     struct open_how how = {};
-    how.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY;
+    // Not blocking: a FIFO in place of the file must not hold vold, which holds its lock.
+    how.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK;
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV;
     int fd = TEMP_FAILURE_RETRY(static_cast<int>(
             syscall(__NR_openat2, root.get(), path.c_str() + sizeof(kRoot) - 1, &how, sizeof(how))));
     return fd < 0 ? -errno : fd;
 }
 #endif
+
+void ObbVolume::onFsvmdExit(pid_t pid) {
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    if (pid == mFsvmdPid && getState() == State::kMounted) {
+        LOG(ERROR) << getId() << ": fsvmd ended on its own";
+        unmount();
+    }
+#endif
+}
 
 status_t ObbVolume::doCreate() {
 #ifdef VOLD_PUBLIC_FS_IN_VM
@@ -107,8 +124,8 @@ status_t ObbVolume::doDestroy() {
 status_t ObbVolume::doMount() {
 #ifdef VOLD_PUBLIC_FS_IN_VM
     if (mFsvmdPid > 0) return -EBUSY;
-    if (sObbVms >= kMaxObbVms) {
-        LOG(ERROR) << getId() << " not mounted: " << kMaxObbVms << " OBB images are mounted already";
+    if (sObbVms >= kMaxObbVms || sObbVmsByOwner[mOwnerGid] >= kMaxObbVmsPerOwner) {
+        LOG(ERROR) << getId() << " not mounted: too many OBB images are mounted already";
         return -EBUSY;
     }
     android::base::unique_fd fd(OpenObb(mSourcePath));
@@ -138,6 +155,7 @@ status_t ObbVolume::doMount() {
         return -EIO;
     }
     sObbVms++;
+    sObbVmsByOwner[mOwnerGid]++;
     return OK;
 #endif
     auto path = StringPrintf("/mnt/obb/%s", getId().c_str());
@@ -167,6 +185,7 @@ status_t ObbVolume::doUnmount() {
         fsvm::Stop(mFsvmdPid);
         mFsvmdPid = -1;
         sObbVms--;
+        if (--sObbVmsByOwner[mOwnerGid] <= 0) sObbVmsByOwner.erase(mOwnerGid);
     }
 #endif
     rmdir(path.c_str());

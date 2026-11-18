@@ -267,6 +267,14 @@ void Disk::removeAddedPartitions() {
 }
 
 void Disk::createPublicVolumeInVm(const fsvm::Part& part) {
+    // A crafted table can list many FAT partitions. Each served one holds a VM.
+    static constexpr int kMaxPublicPerDisk = 4;
+    if (mPublicVolumes >= kMaxPublicPerDisk) {
+        LOG(WARNING) << mId << ": not serving partition " << part.index << ", " << kMaxPublicPerDisk
+                     << " public volumes on this disk already";
+        return;
+    }
+    mPublicVolumes++;
     auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(mDevice, mDevPath, mSysPath, mSize, part));
     if (mJustPartitioned) {
         LOG(DEBUG) << "Device just partitioned; silently formatting";
@@ -311,7 +319,12 @@ void Disk::createUnopenableVolume() {
     createPublicVolumeInVm(whole);
 }
 
-void Disk::reprobeInVm() {
+void Disk::reprobeInVm(bool changed) {
+    if (changed) {
+        mReprobePending = false;
+        readPartitions();
+        return;
+    }
     // Only while the disk still shows the result of a failed probe, and nothing is mounted from it.
     if (!mProbeFailed) return;
     for (const auto& vol : mVolumes) {
@@ -321,17 +334,50 @@ void Disk::reprobeInVm() {
     readPartitions();
 }
 
-static void ScheduleReprobe(const std::string& diskId, int delaySeconds) {
-    std::thread([diskId, delaySeconds] {
+static void ScheduleReprobe(const std::string& diskId, int delaySeconds, bool changed) {
+    std::thread([diskId, delaySeconds, changed] {
         std::this_thread::sleep_for(std::chrono::seconds(delaySeconds));
         std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
         auto disk = VolumeManager::Instance()->findDisk(diskId);
-        if (disk) disk->reprobeInVm();
+        if (disk) disk->reprobeInVm(changed);
     }).detach();
 }
 
+static int64_t BootMs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
 status_t Disk::readPartitionsInVm(int maxMinors) {
+    // A change event without a change (same medium sequence, same size) probes nothing: a device that sends them in
+    // a loop must not keep vold starting VMs. A real change comes at most once in 3 s, later ones are folded into one.
+    std::string seq;
+    ReadFileToString(mSysPath + "/diskseq", &seq);
+    if (mProbed && !mJustPartitioned && !mProbeFailed && seq == mProbedSeq && mSize == mProbedSize) {
+        LOG(VERBOSE) << mId << ": nothing changed, the partition table is not read again";
+        return OK;
+    }
+    if (mProbed && !mJustPartitioned && BootMs() - mProbedAtMs < 3000) {
+        if (!mReprobePending) {
+            mReprobePending = true;
+            ScheduleReprobe(getId(), 3, true);
+        }
+        return OK;
+    }
+    mProbed = true;
+    mProbedSeq = seq;
+    mProbedSize = mSize;
+    mProbedAtMs = BootMs();
+
+    std::string partscan;
+    if (ReadFileToString(mSysPath + "/partscan", &partscan) && android::base::Trim(partscan) != "0") {
+        LOG(ERROR) << mId << ": Android's kernel reads this disk's partition table "
+                   << "(CONFIG_BLK_NO_EXTERNAL_PART_SCAN is missing)";
+    }
+
     destroyAllVolumes();
+    mPublicVolumes = 0;
 
     // No medium (an empty slot in a USB card reader): nothing to read, as when sgdisk failed before.
     if (mSize == static_cast<uint64_t>(-1) || mSize < 512) {
@@ -351,7 +397,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
         LOG(ERROR) << mId << ": the filesystem VM could not read the disk";
         createUnopenableVolume();
         // A protected VM start can be refused for a while after boot: try twice more, later.
-        if (++mProbeFailures <= 2) ScheduleReprobe(getId(), mProbeFailures == 1 ? 15 : 60);
+        if (++mProbeFailures <= 2) ScheduleReprobe(getId(), mProbeFailures == 1 ? 15 : 60, false);
     } else {
         mProbeFailures = 0;
         for (const auto& part : layout.parts) {
@@ -605,6 +651,7 @@ status_t Disk::partitionPublic() {
     // sgdisk below writes the new table. Zeroing the old one first means it never reads a table from the card.
     if (isVmDisk() && fsvm::ZeroTables(mDevPath, mSize) != OK) {
         LOG(ERROR) << "Failed to clear the old partition table";
+        mJustPartitioned = false;
         return -EIO;
     }
 #endif
@@ -656,6 +703,7 @@ status_t Disk::partitionMixed(int8_t ratio) {
     // sgdisk below writes the new table. Zeroing the old one first means it never reads a table from the card.
     if (isVmDisk() && fsvm::ZeroTables(mDevPath, mSize) != OK) {
         LOG(ERROR) << "Failed to clear the old partition table";
+        mJustPartitioned = false;
         return -EIO;
     }
 #endif

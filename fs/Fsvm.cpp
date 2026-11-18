@@ -41,7 +41,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <thread>
+
+#include "VolumeManager.h"
+#include "model/VolumeBase.h"
 
 using android::base::ParseUint;
 using android::base::Split;
@@ -54,13 +62,17 @@ namespace fsvm {
 
 static constexpr char kFsvmd[] = "/system_ext/bin/fsvmd";
 /*
- * vold holds its lock while it waits, and system_server's watchdog asks for that lock, so both waits stay well under a
- * minute. fsvmd retries a refused VM start twice (1 s, then 2 s later), waits up to 10 s for the VM to answer, and
- * MOUNT may read a whole FAT for the first free-space count (fsvm_proto Deadlines::mount, 30 s). A small VM answers in
- * about 2 s and a card mounts in a few more.
+ * vold holds its lock while it waits, and system_server's watchdog asks for that lock (60 s). fsvmd keeps to 20 s
+ * for a probe and 30 s for a mount (fsvmd PROBE_BUDGET and SERVE_BUDGET: VM starts, the check, the mount and the
+ * first free-space count), vold waits a little longer, a stop takes at most 2 s, and the steps after the VM mount
+ * get 15 s (Guard). So a mount holds the lock for at most 50 s, a probe for 25 s.
  */
-static constexpr int kProbeTimeoutMs = 30000;
-static constexpr int kReadyTimeoutMs = 55000;
+static constexpr int kProbeTimeoutMs = 23000;
+static constexpr int kReadyTimeoutMs = 33000;
+static constexpr int kStopMs = 2000;
+/* Serving VMs at a time, OBB images excluded (ObbVolume has its own caps). */
+static constexpr int kMaxServing = 6;
+static std::atomic<int> sServing{0};
 static constexpr size_t kMaxProbeOutput = 4096;
 static constexpr size_t kMaxParts = 16;
 static constexpr uint32_t kMaxIndex = 128;
@@ -136,6 +148,11 @@ static bool IsGuid(const std::string& s) {
            IsHex(s, 14, 4) && s[18] == '-' && IsHex(s, 19, 4) && s[23] == '-' && IsHex(s, 24, 12);
 }
 
+/* Only plain decimal digits: ParseUint alone would take spaces, a sign or hex. */
+static bool Digits(const std::string& s) {
+    return !s.empty() && s.size() <= 20 && s.find_first_not_of("0123456789") == std::string::npos;
+}
+
 static bool DecodeLabel(const std::string& hex, std::string* out) {
     out->clear();
     if (hex == "-") return true;
@@ -163,7 +180,7 @@ status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out) {
     if (lines.size() < 2) return -EINVAL;
     std::vector<std::string> head = Split(lines[0], " ");
     size_t count = 0;
-    if (head.size() != 4 || head[0] != "LAYOUT" || head[1] != "1" || !ParseUint(head[3], &count) ||
+    if (head.size() != 4 || head[0] != "LAYOUT" || head[1] != "1" || !Digits(head[3]) || !ParseUint(head[3], &count) ||
         count > kMaxParts || lines.size() != count + 2 || lines.back() != "END") {
         return -EINVAL;
     }
@@ -173,7 +190,8 @@ status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out) {
     for (size_t i = 0; i < count; i++) {
         std::vector<std::string> f = Split(lines[i + 1], " ");
         Part p;
-        if (f.size() != 10 || f[0] != "PART" || !ParseUint(f[1], &p.index, kMaxIndex) ||
+        if (f.size() != 10 || f[0] != "PART" || !Digits(f[1]) || !Digits(f[3]) || !Digits(f[4]) || !Digits(f[8]) ||
+            !ParseUint(f[1], &p.index, kMaxIndex) ||
             !ParseUint(f[3], &p.start) || !ParseUint(f[4], &p.length) || !ParseUint(f[8], &p.metaBytes)) {
             return -EINVAL;
         }
@@ -256,8 +274,27 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out) {
     return OK;
 }
 
+/*
+ * Waits for fsvmd to end and, when it ended on its own while its volume is still mounted (its VM broke and no new
+ * one came up), has the volume unmounted and reported as not opened.
+ */
+static void Watch(unique_fd pidfd, std::string volumeId, pid_t pid) {
+    std::thread([pidfd = std::move(pidfd), volumeId, pid]() {
+        struct pollfd pfd = {pidfd.get(), POLLIN, 0};
+        while (TEMP_FAILURE_RETRY(poll(&pfd, 1, -1)) != 1) {
+        }
+        std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
+        auto vol = VolumeManager::Instance()->findVolume(volumeId);
+        if (vol) vol->onFsvmdExit(pid);
+    }).detach();
+}
+
 status_t Mount(Volume&& v, pid_t* pid) {
     *pid = -1;
+    if (!v.obb && sServing >= kMaxServing) {
+        LOG(ERROR) << "fsvm: " << kMaxServing << " volumes are served already, not " << v.volumeId;
+        return -EBUSY;
+    }
     unique_fd fuse(TEMP_FAILURE_RETRY(open("/dev/fuse", O_RDWR | O_CLOEXEC)));
     if (fuse < 0) {
         PLOG(ERROR) << "fsvm: opening /dev/fuse";
@@ -299,6 +336,8 @@ status_t Mount(Volume&& v, pid_t* pid) {
     readyWrite.reset();
     v.fd.reset();
     fuse.reset();
+    // Opened before anyone can reap the child, so it always names this process.
+    unique_fd pidfd(static_cast<int>(syscall(__NR_pidfd_open, child, 0)));
 
     struct pollfd pfd = {readyRead.get(), POLLIN, 0};
     char c = 0;
@@ -306,6 +345,12 @@ status_t Mount(Volume&& v, pid_t* pid) {
         TEMP_FAILURE_RETRY(read(readyRead.get(), &c, 1)) == 1 && c == 'R') {
         LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child;
         *pid = child;
+        if (!v.obb) sServing++;
+        if (pidfd >= 0) {
+            Watch(std::move(pidfd), v.volumeId, child);
+        } else {
+            PLOG(WARNING) << "fsvm: no pidfd for fsvmd " << child;
+        }
         return OK;
     }
     LOG(ERROR) << "fsvm: the filesystem VM did not serve " << v.volumeId << ", not mounting it";
@@ -317,7 +362,45 @@ status_t Mount(Volume&& v, pid_t* pid) {
 void Stop(pid_t pid) {
     if (pid <= 0) return;
     kill(pid, SIGTERM);
-    if (Reap(pid, 5000) < 0) LOG(WARNING) << "fsvm: fsvmd " << pid << " killed";
+    if (Reap(pid, kStopMs) < 0) LOG(WARNING) << "fsvm: fsvmd " << pid << " killed";
+}
+
+void Served(bool obb, bool starting) {
+    if (obb) return;
+    if (starting) {
+        sServing++;
+    } else if (sServing > 0) {
+        sServing--;
+    }
+}
+
+struct Guard::State {
+    std::mutex lock;
+    std::condition_variable cv;
+    bool done = false;
+    unique_fd pidfd;
+};
+
+Guard::Guard(pid_t pid, int ms) : mState(std::make_shared<State>()) {
+    // Through a pidfd, so that a process that ended and was reaped meanwhile can never be mistaken for another.
+    mState->pidfd.reset(static_cast<int>(syscall(__NR_pidfd_open, pid, 0)));
+    std::thread([state = mState, pid, ms]() {
+        std::unique_lock<std::mutex> l(state->lock);
+        if (!state->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return state->done; }) &&
+            state->pidfd >= 0) {
+            LOG(ERROR) << "fsvm: the mount steps after the VM took too long, stopping fsvmd " << pid;
+            // Ends its FUSE connection, so the steps waiting on it fail at once.
+            syscall(__NR_pidfd_send_signal, state->pidfd.get(), SIGKILL, nullptr, 0);
+        }
+    }).detach();
+}
+
+Guard::~Guard() {
+    {
+        std::lock_guard<std::mutex> l(mState->lock);
+        mState->done = true;
+    }
+    mState->cv.notify_all();
 }
 
 static bool ReadNumber(const std::string& path, uint64_t* out) {

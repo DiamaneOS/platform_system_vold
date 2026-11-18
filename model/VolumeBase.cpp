@@ -282,6 +282,10 @@ status_t VolumeBase::format(const std::string& fsType) {
     return res;
 }
 
+void VolumeBase::setUnopenable() {
+    if (mState == State::kUnmounted) setState(State::kUnopenable);
+}
+
 status_t VolumeBase::doFormat(const std::string& fsType) {
     return -ENOTSUP;
 }

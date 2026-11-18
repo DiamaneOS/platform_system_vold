@@ -60,6 +60,7 @@ class PublicVolume : public VolumeBase {
     status_t initAsecStage();
 
     bool mountFailedInVm() const override { return mVmFailed; }
+    void onFsvmdExit(pid_t pid) override;
     status_t checkInVm();
     status_t mountInVm(gid_t gid);
     status_t formatInVm(const std::string& fsType);

@@ -110,6 +110,9 @@ class VolumeBase {
 
     std::shared_ptr<VolumeBase> findVolume(const std::string& id);
 
+    /* DiamaneOS: the fsvmd serving this volume ended on its own (vold's lock is held) */
+    virtual void onFsvmdExit(pid_t pid) {}
+
     bool isEmulated() { return mType == Type::kEmulated; }
     bool isVisibleForRead() const { return (mMountFlags & MountFlags::kVisibleForRead) != 0; }
     bool isVisibleForWrite() const { return (mMountFlags & MountFlags::kVisibleForWrite) != 0; }
@@ -136,6 +139,8 @@ class VolumeBase {
     virtual status_t doFormat(const std::string& fsType);
     /* DiamaneOS: whether the last failed mount failed in the filesystem VM (state kUnopenable) */
     virtual bool mountFailedInVm() const { return false; }
+    /* DiamaneOS: after an unmount, reports the volume as not opened */
+    void setUnopenable();
 
     status_t setId(const std::string& id);
     status_t setPath(const std::string& path);

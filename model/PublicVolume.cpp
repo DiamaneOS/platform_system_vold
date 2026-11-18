@@ -169,24 +169,20 @@ void PublicVolume::removeTempPartition() {
 }
 
 status_t PublicVolume::checkInVm() {
+    // The filesystem check runs in the VM, as part of fsvmd's mount, with the same tools vold ran here before.
     if (mFsType != "vfat" && mFsType != "exfat") {
         LOG(ERROR) << getId() << ": the filesystem VM found no FAT or exFAT filesystem";
         mVmFailed = true;
         return -EIO;
     }
-    std::string dev;
-    if (addTempPartition(&dev) != OK) {
-        // Only when another partition of this disk is in use (adoptable storage next to a public partition).
-        LOG(WARNING) << getId() << " has no partition device for fsck, mounting without the check";
-        return OK;
-    }
-    int bad = mFsType == "vfat" ? vfat::Check(dev) : exfat::Check(dev);
-    removeTempPartition();
-    if (bad) {
-        LOG(ERROR) << getId() << " failed filesystem check";
-        return -EIO;
-    }
     return OK;
+}
+
+void PublicVolume::onFsvmdExit(pid_t pid) {
+    if (pid != mFsvmdPid || getState() != State::kMounted) return;
+    LOG(ERROR) << getId() << ": fsvmd ended on its own, the volume could not be served any more";
+    unmount();
+    setUnopenable();
 }
 
 status_t PublicVolume::mountInVm(gid_t gid) {
@@ -255,16 +251,23 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
         LOG(ERROR) << getId() << " failed to format";
         return -EIO;
     }
-    // The new filesystem has a new serial, so the UUID changes. The VM reads it again, as blkid did at mount.
-    fsvm::Layout layout;
-    mPart.fsType.clear();
+    // The new filesystem has a new serial, so the UUID changes. The VM reads it again, as blkid did at mount. If it
+    // cannot say, the volume keeps the type just written (fsvmd checks it at mount) and has no UUID until then.
+    mPart.fsType = pick;
     mPart.fsUuid.clear();
     mPart.label.clear();
-    if (fsvm::Probe(mDiskDevPath, mDiskBytes, &layout) == OK) {
+    mPart.metaBytes = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        fsvm::Layout layout;
+        if (fsvm::Probe(mDiskDevPath, mDiskBytes, &layout) != OK) continue;
         for (const auto& p : layout.parts) {
-            if (p.index == mPart.index && p.start == mPart.start && p.length == mPart.length) mPart = p;
+            if (p.index == mPart.index && p.start == mPart.start && p.length == mPart.length && p.fsType == pick) {
+                mPart = p;
+                return OK;
+            }
         }
     }
+    LOG(WARNING) << getId() << ": the filesystem VM did not confirm the new " << pick << " filesystem";
     return OK;
 }
 
@@ -341,6 +344,9 @@ status_t PublicVolume::doMount() {
         rmdir(mRawPath.c_str());
         return -EIO;
     }
+    // Every later step reads through fsvmd. Any failure from here on is the VM path's, and must not offer a format.
+    mVmFailed = true;
+    fsvm::Guard guard(mFsvmdPid, 15000);
 #else
     if (mFsType == "vfat") {
         if (vfat::Mount(mDevPath, mRawPath, false, false, false, AID_ROOT,
@@ -586,7 +592,10 @@ status_t PublicVolume::doUnmount() {
     }
 #ifdef VOLD_PUBLIC_FS_IN_VM
     // The FUSE mount is gone, so fsvmd and its VM can stop.
-    fsvm::Stop(mFsvmdPid);
+    if (mFsvmdPid > 0) {
+        fsvm::Stop(mFsvmdPid);
+        fsvm::Served(false, false);
+    }
     mFsvmdPid = -1;
 #endif
     if(rmdir(mRawPath.c_str()) != 0) {

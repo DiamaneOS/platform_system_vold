@@ -130,11 +130,19 @@ class Disk {
     void createUnopenableVolume();
     void removeAddedPartitions();
   public:
-    /* Reads the table again after a failed probe (a protected VM start can be refused for a while after boot) */
-    void reprobeInVm();
+    /* Reads the table again after a failed probe (a protected VM start can be refused for a while after boot), or
+       after a change event that came too soon after the last probe (`changed`) */
+    void reprobeInVm(bool changed);
   private:
     int mProbeFailures = 0;
     bool mProbeFailed = false;
+    /* The medium and size last probed, and when, so that change events without a change probe nothing */
+    bool mProbed = false;
+    std::string mProbedSeq;
+    uint64_t mProbedSize = 0;
+    int64_t mProbedAtMs = 0;
+    bool mReprobePending = false;
+    int mPublicVolumes = 0;
     /* Partitions vold added to Android's kernel (adoptable storage) */
     std::vector<uint32_t> mAddedPartitions;
 

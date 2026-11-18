@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <utils/Errors.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,23 @@ status_t Mount(Volume&& v, pid_t* pid);
 
 /* Stops fsvmd after its FUSE mount is gone. */
 void Stop(pid_t pid);
+
+/* Counts a serving fsvmd that ended (Mount counts the ones that start). */
+void Served(bool obb, bool starting);
+
+/*
+ * Kills fsvmd `pid` unless it is cancelled within `ms`: the steps of a mount after the VM served the volume go through
+ * fsvmd, and vold holds its lock until they end.
+ */
+class Guard {
+  public:
+    Guard(pid_t pid, int ms);
+    ~Guard();
+
+  private:
+    struct State;
+    std::shared_ptr<State> mState;
+};
 
 /*
  * Adds partition `p` of a disk whose table Android's kernel does not read, at the range the VM read. Returns its

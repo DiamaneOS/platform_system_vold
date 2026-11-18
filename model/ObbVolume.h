@@ -32,6 +32,8 @@ class ObbVolume : public VolumeBase {
     ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid);
     virtual ~ObbVolume();
 
+    void onFsvmdExit(pid_t pid) override;
+
   protected:
     status_t doCreate() override;
     status_t doDestroy() override;
