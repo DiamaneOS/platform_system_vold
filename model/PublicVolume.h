@@ -51,6 +51,8 @@ class PublicVolume : public VolumeBase {
     status_t bindMountForUser(userid_t user_id);
     std::string getStableName();
 
+    void prepareStop() override;
+
   protected:
     status_t doCreate() override;
     status_t doDestroy() override;
@@ -64,8 +66,13 @@ class PublicVolume : public VolumeBase {
     bool mountFailedInVm() const override { return mVmFailed; }
     bool writeBackFailed() const override { return mWriteBackFailed; }
     void onFsvmdExit(pid_t pid) override;
+    void onMountFailed() override;
+    void doPostMount() override;
+    /* DiamaneOS: the steps of doMount around the filesystem VM (PublicVolumeFsvm.cpp) */
     status_t checkInVm();
     status_t mountInVm(gid_t gid);
+    status_t serveInVm(gid_t gid, bool* servedReadOnly);
+    int guardMs() const;
     status_t formatInVm(const std::string& fsType);
     status_t addTempPartition(std::string* path);
     void removeTempPartition();

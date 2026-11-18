@@ -66,18 +66,22 @@ static constexpr char kService[] = "/dev/socket/fsvmd";
  * vold holds its lock while it waits, and system_server's watchdog asks for that lock (60 s). Every wait is bounded:
  *
  * - probe: fsvmd keeps to 20 s (PROBE_BUDGET), vold reads for at most 23 s, then Reap takes at most 4 s in all.
- *   At most 27 s.
+ *   At most 27 s. Probes of all disks share a limit (TakeProbe), so a device that comes and goes in a loop cannot
+ *   keep vold starting VMs.
+ * - format: the wipe and the format tool, then one probe of at most 10 s (plus 1 s for the kill), never the 27 s.
  * - OBB on a card: the open and its attributes go through the card's fsvmd, guarded for 8 s.
- * - mount: fsvmd keeps to 30 s (SERVE_BUDGET: VM starts, the check, the mount, the first free-space count), vold
- *   waits 33 s. The steps after it (MediaProvider's FUSE, bind mounts) end at the deadline PublicVolume's Guard
- *   sets: 48 s after the mount began, at least 15 s. A failure before the VM served adds a stop of at most 3 s
- *   (51 s). A failure after it runs doUnmount, whose steps fail at once on the ended FUSE connection and whose stop
+ * - mount: fsvmd keeps to 34 s (SERVE_BUDGET: VM starts, the check of up to 18 s, the mount, the first
+ *   free-space count), vold waits 37 s. The steps after it (MediaProvider's FUSE, bind mounts) end at the deadline
+ *   PublicVolume's Guard sets: 52 s after the mount began, at least 15 s. A failure before the VM served adds a stop
+ *   of at most 3 s (55 s). A failure after it runs doUnmount, whose steps fail at once on the ended FUSE connection and whose stop
  *   finds fsvmd ended: a few seconds more.
  * - unmount: OBB images served from the card are stopped together first (3 s), the steps before the stop get 15 s
- *   (a Guard ends fsvmd when FUSE requests hang), the orderly stop at most kSyncMs plus 3 s. At most 47 s.
+ *   (a Guard ends fsvmd when FUSE requests hang), the orderly stop at most kSyncMs plus 3 s. At most 47 s. When a
+ *   disk goes with several volumes, all of them are asked to write back first (RequestWriteBack) and do so at the
+ *   same time, so each later stop finds its fsvmd done.
  */
 static constexpr int kProbeTimeoutMs = 23000;
-static constexpr int kReadyTimeoutMs = 33000;
+static constexpr int kReadyTimeoutMs = 37000;
 /*
  * After vold unmounted FUSE, fsvmd writes back and unmounts in the VM: 2 s for a call in progress, then as long as the
  * VM's dirty data keeps going down, at most 22 s in all (fsvmd CLOSE_LOCK_WAIT and CLOSE_MAX).
@@ -349,7 +353,7 @@ static status_t ReadAll(int fd, int64_t deadline, size_t max, std::string* out) 
     }
 }
 
-status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out) {
+status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int timeoutMs) {
     unique_fd dev(TEMP_FAILURE_RETRY(open(diskPath.c_str(), O_RDONLY | O_CLOEXEC)));
     if (dev < 0) {
         PLOG(ERROR) << "fsvm: opening " << diskPath;
@@ -373,7 +377,8 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out) {
     wr.reset();
     dev.reset();
     std::string text;
-    status_t res = ReadAll(rd.get(), NowMs() + kProbeTimeoutMs, kMaxProbeOutput, &text);
+    int readMs = timeoutMs > 0 ? std::min(timeoutMs, kProbeTimeoutMs) : kProbeTimeoutMs;
+    status_t res = ReadAll(rd.get(), NowMs() + readMs, kMaxProbeOutput, &text);
     int rc = Reap(child, res == OK ? 3000 : 0, 0);
     if (res != OK || rc != 0) {
         LOG(ERROR) << "fsvm: the filesystem VM did not read " << diskPath << " (" << res << ", exit " << rc << ")";
@@ -405,7 +410,8 @@ static void Watch(unique_fd conn, std::string volumeId, pid_t pid) {
     }).detach();
 }
 
-status_t Mount(Volume&& v, pid_t* pid) {
+status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
+    if (servedReadOnly) *servedReadOnly = false;
     *pid = -1;
     if (!v.obb && sServing >= kMaxServing) {
         LOG(ERROR) << "fsvm: " << kMaxServing << " volumes are served already, not " << v.volumeId;
@@ -458,7 +464,9 @@ status_t Mount(Volume&& v, pid_t* pid) {
     struct pollfd pfd = {readyRead.get(), POLLIN, 0};
     char c = 0;
     if (TEMP_FAILURE_RETRY(poll(&pfd, 1, kReadyTimeoutMs)) == 1 &&
-        TEMP_FAILURE_RETRY(read(readyRead.get(), &c, 1)) == 1 && c == 'R') {
+        TEMP_FAILURE_RETRY(read(readyRead.get(), &c, 1)) == 1 && (c == 'R' || c == 'r')) {
+        // r: asked for writing, served read-only by the VM (fsvmd main.rs).
+        if (servedReadOnly) *servedReadOnly = c == 'r';
         LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child;
         *pid = child;
         if (!v.obb) sServing++;
@@ -492,6 +500,41 @@ int Stop(pid_t pid, bool orderly) {
 void RequestStop(pid_t pid) {
     unique_fd conn = Connection(pid);
     if (conn >= 0) Tell(conn.get(), 'T');
+}
+
+void RequestWriteBack(pid_t pid) {
+    unique_fd conn = Connection(pid);
+    if (conn >= 0) Tell(conn.get(), 'W');
+}
+
+/*
+ * Probes for all disks together: 4 at once, then one per 5 s. A probe is a VM start under vold's lock, and a device
+ * that detaches and attaches in a loop is a new disk each time. Only called with vold's lock held.
+ */
+static constexpr int kProbeBurst = 4;
+static constexpr int64_t kProbeEveryMs = 5000;
+static int sProbes = kProbeBurst;
+static int64_t sProbeRefillMs = 0;
+
+bool TakeProbe(int64_t nowMs, int64_t* waitMs) {
+    if (sProbes >= kProbeBurst) {
+        sProbeRefillMs = nowMs;
+    } else if (nowMs - sProbeRefillMs >= kProbeEveryMs) {
+        int64_t n = (nowMs - sProbeRefillMs) / kProbeEveryMs;
+        sProbes = static_cast<int>(std::min<int64_t>(kProbeBurst, sProbes + n));
+        sProbeRefillMs = sProbes >= kProbeBurst ? nowMs : sProbeRefillMs + n * kProbeEveryMs;
+    }
+    if (sProbes == 0) {
+        *waitMs = std::max<int64_t>(1, sProbeRefillMs + kProbeEveryMs - nowMs);
+        return false;
+    }
+    sProbes--;
+    return true;
+}
+
+void ResetProbes() {
+    sProbes = kProbeBurst;
+    sProbeRefillMs = 0;
 }
 
 void Served(bool obb, bool starting) {

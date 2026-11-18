@@ -129,11 +129,29 @@ class Disk {
     bool createPrivateVolumeInVm(const fsvm::Part& part);
     void createUnopenableVolume();
     void removeAddedPartitions();
+    /* Asks every volume of the disk to start writing back, before they are stopped one by one */
+    void prepareStopAll();
   public:
-    /* Reads the table again after a failed probe (a protected VM start can be refused for a while after boot), or
-       after a change event that came too soon after the last probe (`changed`) */
-    void reprobeInVm(bool changed);
+    enum class Reprobe {
+        /* the last probe failed (a protected VM start can be refused for a while after boot) */
+        kFailedProbe,
+        /* a change event came too soon after the last probe */
+        kChanged,
+        /* the probe was put off: too many disks were read lately */
+        kDeferred,
+        /* a volume could not be opened: its VM did not start */
+        kMountRetry,
+    };
+    /* Reads the table again, later, when it is still worth it (DiskFsvm.cpp) */
+    void reprobeInVm(Reprobe why);
+    /* A volume of the disk failed to mount in its VM: the volumes are made again later, and the framework mounts them */
+    void retryMountLater();
+    /* A volume of the disk mounted: later failures get their retries again */
+    void noteMounted();
   private:
+    bool mForceProbe = false;
+    int mMountRetries = 0;
+    bool mMountRetryPending = false;
     int mProbeFailures = 0;
     bool mProbeFailed = false;
     /* The medium and size last probed, and when, so that change events without a change probe nothing */

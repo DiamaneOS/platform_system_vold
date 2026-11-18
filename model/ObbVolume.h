@@ -55,6 +55,9 @@ class ObbVolume : public VolumeBase {
 
     /* DiamaneOS: fsvmd serving the image from the filesystem VM, or -1 */
     pid_t mFsvmdPid = -1;
+    /* DiamaneOS: doMount and doUnmount with the filesystem VM (ObbVolumeFsvm.cpp) */
+    status_t mountInVm();
+    void stopInVm();
 
     DISALLOW_COPY_AND_ASSIGN(ObbVolume);
 };

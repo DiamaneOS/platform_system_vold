@@ -114,6 +114,8 @@ class VolumeBase {
 
     /* DiamaneOS: the fsvmd serving this volume ended on its own (vold's lock is held) */
     virtual void onFsvmdExit(pid_t pid) {}
+    /* DiamaneOS: the volume is about to go with others of its disk: start writing it back now (PublicVolume) */
+    virtual void prepareStop() {}
 
     bool isEmulated() { return mType == Type::kEmulated; }
     bool isVisibleForRead() const { return (mMountFlags & MountFlags::kVisibleForRead) != 0; }
@@ -143,6 +145,10 @@ class VolumeBase {
     virtual bool mountFailedInVm() const { return false; }
     /* DiamaneOS: whether the last unmount could not write the volume back (state kNotWrittenBack) */
     virtual bool writeBackFailed() const { return false; }
+    /* DiamaneOS: a failed mount (state set already), for a retry later (PublicVolume) */
+    virtual void onMountFailed() {}
+    /* DiamaneOS: report a mounted volume as mounted read-only (the filesystem VM served it read-only) */
+    void setReportReadOnly(bool readOnly) { mReportReadOnly = readOnly; }
     /* DiamaneOS: after an unmount, reports the volume as not opened */
     void setUnopenable();
 
@@ -170,6 +176,8 @@ class VolumeBase {
     bool mCreated;
     /* Current state of volume */
     State mState;
+    /* DiamaneOS: see setReportReadOnly */
+    bool mReportReadOnly = false;
     /* Path to mounted volume */
     std::string mPath;
     /* Path to internal backing storage */

@@ -46,10 +46,14 @@ VolumeBase::~VolumeBase() {
 
 void VolumeBase::setState(State state) {
     mState = state;
+    if (state != State::kMounted) mReportReadOnly = false;
 
     auto listener = getListener();
     if (listener) {
-        listener->onVolumeStateChanged(getId(), static_cast<int32_t>(mState),
+        // DiamaneOS: a volume the filesystem VM served read-only stays kMounted inside vold, and the framework sees
+        // it as mounted read-only.
+        State reported = (state == State::kMounted && mReportReadOnly) ? State::kMountedReadOnly : mState;
+        listener->onVolumeStateChanged(getId(), static_cast<int32_t>(reported),
                                        static_cast<int32_t>(mMountUserId));
     }
 }
@@ -238,6 +242,7 @@ status_t VolumeBase::mount() {
         setState(State::kMounted);
     } else {
         setState(mountFailedInVm() ? State::kUnopenable : State::kUnmountable);
+        onMountFailed();
     }
 
     if (res == OK) {

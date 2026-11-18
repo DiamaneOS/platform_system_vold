@@ -101,6 +101,26 @@ TEST(FsvmTest, LogicalPartitionsAndBlockSizes) {
     EXPECT_NE(OK, ParseLayout(gpt(48, 100), kDisk, &l, 1024));
 }
 
+TEST(FsvmTest, ProbesShareALimit) {
+    // 4 at once, then one per 5 s, for all disks together (a device that comes and goes in a loop).
+    ResetProbes();
+    int64_t wait = 0;
+    for (int i = 0; i < 4; i++) EXPECT_TRUE(TakeProbe(1000, &wait)) << i;
+    EXPECT_FALSE(TakeProbe(1000, &wait));
+    EXPECT_EQ(5000, wait);
+    EXPECT_FALSE(TakeProbe(5999, &wait));
+    EXPECT_EQ(1, wait);
+    EXPECT_TRUE(TakeProbe(6000, &wait));
+    EXPECT_FALSE(TakeProbe(6000, &wait));
+    // Two periods later two more, never more than 4 after a long pause.
+    EXPECT_TRUE(TakeProbe(16000, &wait));
+    EXPECT_TRUE(TakeProbe(16000, &wait));
+    EXPECT_FALSE(TakeProbe(16000, &wait));
+    for (int i = 0; i < 4; i++) EXPECT_TRUE(TakeProbe(100000, &wait)) << i;
+    EXPECT_FALSE(TakeProbe(100000, &wait));
+    ResetProbes();
+}
+
 }  // namespace fsvm
 }  // namespace vold
 }  // namespace android

@@ -61,8 +61,9 @@ struct Layout {
     std::vector<Part> parts;
 };
 
-/* Has the filesystem VM read the partition table of the disk at `diskPath`. */
-status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out);
+/* Has the filesystem VM read the partition table of the disk at `diskPath`. A `timeoutMs` shorter than the default
+ * (the check after a format) ends the probe early. */
+status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int timeoutMs = 0);
 
 /*
  * Parses and checks fsvmd's probe output (exposed for vold_tests). `blockSize`: the disk's logical block size, which
@@ -87,9 +88,10 @@ struct Volume {
 
 /*
  * Serves `v` at `v.target` through FUSE from the filesystem VM. Returns OK once the VM serves it, with fsvmd's pid
- * in `pid`. On any failure nothing stays mounted: there is no fallback to Android's kernel.
+ * in `pid`, and in `servedReadOnly` whether the VM served a volume asked for writing read-only (its check did not
+ * finish in time, or its driver found an error). On any failure nothing stays mounted: there is no fallback to Android's kernel.
  */
-status_t Mount(Volume&& v, pid_t* pid);
+status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly = nullptr);
 
 /*
  * Stops fsvmd. `orderly`: its FUSE mount is gone, and fsvmd writes the volume back and unmounts it in the VM before
@@ -104,6 +106,16 @@ static constexpr int kExitNotWrittenBack = 3;
 
 /* Asks fsvmd to stop now, without waiting: Stop then reaps it. For stopping several at once. */
 void RequestStop(pid_t pid);
+
+/* Asks fsvmd to write its volume back and end, with the full time for it, without waiting: several volumes of a disk
+ * that goes write back together, and each Stop then finds its fsvmd done. */
+void RequestWriteBack(pid_t pid);
+
+/* Takes one of the probes all disks share (4 at once, then one per 5 s). When none is left, says in `waitMs` when the
+ * next one comes. vold's lock must be held. */
+bool TakeProbe(int64_t nowMs, int64_t* waitMs);
+/* For tests: all probes free again. */
+void ResetProbes();
 
 /* Counts a serving fsvmd that ended (Mount counts the ones that start). */
 void Served(bool obb, bool starting);
