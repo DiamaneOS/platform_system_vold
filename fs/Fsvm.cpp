@@ -25,7 +25,6 @@
 
 #include <dirent.h>
 #include <fcntl.h>
-#include <grp.h>
 #include <linux/blkpg.h>
 #include <linux/fs.h>
 #include <poll.h>
@@ -34,9 +33,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
-#include <sys/wait.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -44,6 +44,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -60,7 +61,7 @@ namespace android {
 namespace vold {
 namespace fsvm {
 
-static constexpr char kFsvmd[] = "/system_ext/bin/fsvmd";
+static constexpr char kService[] = "/dev/socket/fsvmd";
 /*
  * vold holds its lock while it waits, and system_server's watchdog asks for that lock (60 s). fsvmd keeps to 20 s
  * for a probe and 30 s for a mount (fsvmd PROBE_BUDGET and SERVE_BUDGET: VM starts, the check, the mount and the
@@ -70,6 +71,8 @@ static constexpr char kFsvmd[] = "/system_ext/bin/fsvmd";
 static constexpr int kProbeTimeoutMs = 23000;
 static constexpr int kReadyTimeoutMs = 33000;
 static constexpr int kStopMs = 2000;
+/* The service answers a request at once: it only forks. */
+static constexpr int kStartMs = 3000;
 /* Serving VMs at a time, OBB images excluded (ObbVolume has its own caps). */
 static constexpr int kMaxServing = 6;
 static std::atomic<int> sServing{0};
@@ -78,55 +81,124 @@ static constexpr size_t kMaxParts = 16;
 static constexpr uint32_t kMaxIndex = 128;
 static constexpr size_t kMaxLabelBytes = 47;
 
-/* Forks and runs fsvmd as the system user with exactly the descriptors given as 3, 4 and 5 (-1: none). */
-static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
-    std::vector<const char*> argv;
-    argv.push_back(kFsvmd);
-    for (const auto& a : args) argv.push_back(a.c_str());
-    argv.push_back(nullptr);
-
-    pid_t child = fork();
-    if (child != 0) return child;
-    // Only async-signal-safe calls from here.
-    int fds[3] = {fd3, fd4, fd5};
-    int high[3];
-    for (int i = 0; i < 3; i++) {
-        high[i] = -1;
-        if (fds[i] >= 0 && (high[i] = fcntl(fds[i], F_DUPFD, 10)) < 0) _exit(127);
-    }
-    for (int i = 0; i < 3; i++) {
-        if (high[i] >= 0) {
-            if (dup2(high[i], 3 + i) < 0) _exit(127);
-        } else {
-            close(3 + i);
-        }
-    }
-    syscall(__NR_close_range, 6, ~0U, 0);
-    if (setgroups(0, nullptr) || setresgid(AID_SYSTEM, AID_SYSTEM, AID_SYSTEM) ||
-        setresuid(AID_SYSTEM, AID_SYSTEM, AID_SYSTEM)) {
-        _exit(127);
-    }
-    execv(kFsvmd, const_cast<char**>(argv.data()));
-    _exit(127);
-}
-
 static int64_t NowMs() {
     struct timespec ts;
     clock_gettime(CLOCK_BOOTTIME, &ts);
     return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
 }
 
-/* Waits for `pid` to exit within `ms`, else kills it. Returns its exit status, or -1. */
-static int Reap(pid_t pid, int ms) {
-    int status = 0;
-    for (int waited = 0; waited <= ms; waited += 100) {
-        pid_t r = waitpid(pid, &status, WNOHANG);
-        if (r == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-        if (r < 0) return -1;
-        usleep(100 * 1000);
+/*
+ * fsvmd runs through init's fsvmd service (vendor/diamaneos fsvm/fsvmd/fsvmd.rc), as the system user without
+ * capabilities: vold holds neither setuid nor setgid, and changes no ids. Each fsvmd has one connection to the
+ * service, kept here by its pid. The service passes on a stop (T) or kill (K), kills fsvmd when vold closes the
+ * connection, and closes it after it reported how fsvmd ended (X <status>). See fsvmd/src/launcher.rs.
+ */
+static std::mutex sChildrenLock;
+static std::map<pid_t, unique_fd> sChildren;
+
+/* Reads one answer of the service within `ms`: P <pid>, X <status> or E <errno>. */
+static bool ReadAnswer(int fd, int ms, char* kind, uint64_t* value) {
+    struct pollfd pfd = {fd, POLLIN, 0};
+    if (TEMP_FAILURE_RETRY(poll(&pfd, 1, ms)) != 1 || !(pfd.revents & POLLIN)) return false;
+    char buf[32];
+    ssize_t n = TEMP_FAILURE_RETRY(recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT));
+    if (n < 3 || buf[1] != ' ') return false;
+    buf[n] = '\0';
+    *kind = buf[0];
+    return ParseUint(buf + 2, value, static_cast<uint64_t>(INT32_MAX));
+}
+
+/* Has the service run fsvmd with exactly the descriptors given as 3, 4 and 5 (-1: none). Returns its pid, or -1. */
+static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
+    unique_fd s(socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+    if (s < 0) return -1;
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    strlcpy(addr.sun_path, kService, sizeof(addr.sun_path));
+    if (TEMP_FAILURE_RETRY(connect(s.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)))) {
+        PLOG(ERROR) << "fsvm: the fsvmd service is not there";
+        return -1;
     }
-    kill(pid, SIGKILL);
-    waitpid(pid, nullptr, 0);
+    std::string msg("FSVMD1", 6);
+    msg.push_back('\0');
+    int fds[3] = {fd3, fd4, fd5};
+    int pass[3];
+    int n = 0, mask = 0;
+    for (int i = 0; i < 3; i++) {
+        if (fds[i] >= 0) {
+            mask |= 1 << i;
+            pass[n++] = fds[i];
+        }
+    }
+    msg.push_back(static_cast<char>('0' + mask));
+    msg.push_back('\0');
+    for (const auto& a : args) {
+        msg += a;
+        msg.push_back('\0');
+    }
+    struct iovec iov = {msg.data(), msg.size()};
+    union {
+        char buf[CMSG_SPACE(sizeof(int) * 3)];
+        struct cmsghdr align;
+    } control = {};
+    struct msghdr mh = {};
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    if (n > 0) {
+        mh.msg_control = control.buf;
+        mh.msg_controllen = CMSG_SPACE(sizeof(int) * n);
+        struct cmsghdr* c = CMSG_FIRSTHDR(&mh);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int) * n);
+        memcpy(CMSG_DATA(c), pass, sizeof(int) * n);
+    }
+    if (TEMP_FAILURE_RETRY(sendmsg(s.get(), &mh, MSG_NOSIGNAL)) != static_cast<ssize_t>(msg.size())) {
+        PLOG(ERROR) << "fsvm: sending the request to the fsvmd service";
+        return -1;
+    }
+    char kind = 0;
+    uint64_t value = 0;
+    if (!ReadAnswer(s.get(), kStartMs, &kind, &value) || kind != 'P' || value == 0) {
+        LOG(ERROR) << "fsvm: the fsvmd service did not start fsvmd ("
+                   << (kind == 'E' ? strerror(static_cast<int>(value)) : "no answer") << ")";
+        errno = kind == 'E' ? static_cast<int>(value) : EIO;
+        return -1;
+    }
+    pid_t pid = static_cast<pid_t>(value);
+    std::lock_guard<std::mutex> lock(sChildrenLock);
+    sChildren[pid] = std::move(s);
+    return pid;
+}
+
+/* A second descriptor of fsvmd `pid`'s connection, for a thread that outlives vold's own (Watch, Guard). */
+static unique_fd Connection(pid_t pid) {
+    std::lock_guard<std::mutex> lock(sChildrenLock);
+    auto it = sChildren.find(pid);
+    if (it == sChildren.end()) return {};
+    return unique_fd(fcntl(it->second.get(), F_DUPFD_CLOEXEC, 0));
+}
+
+static void Tell(int conn, char c) {
+    TEMP_FAILURE_RETRY(send(conn, &c, 1, MSG_NOSIGNAL));
+}
+
+/* Waits for fsvmd `pid` to exit within `ms`, else has it killed. Returns its exit status, or -1 when killed. */
+static int Reap(pid_t pid, int ms) {
+    unique_fd conn;
+    {
+        std::lock_guard<std::mutex> lock(sChildrenLock);
+        auto it = sChildren.find(pid);
+        if (it == sChildren.end()) return -1;
+        conn = std::move(it->second);
+        sChildren.erase(it);
+    }
+    char kind = 0;
+    uint64_t value = 0;
+    if (ReadAnswer(conn.get(), ms, &kind, &value) && kind == 'X') return static_cast<int>(value);
+    Tell(conn.get(), 'K');
+    // The service reaps it at once, and closing the connection kills it in any case.
+    ReadAnswer(conn.get(), kStopMs, &kind, &value);
     return -1;
 }
 
@@ -252,8 +324,8 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out) {
     unique_fd rd(p[0]), wr(p[1]);
     pid_t child = Spawn({"--probe", "--disk-bytes", std::to_string(diskBytes)}, dev.get(), -1, wr.get());
     if (child < 0) {
-        PLOG(ERROR) << "fsvm: fork";
-        return -errno;
+        LOG(ERROR) << "fsvm: fsvmd did not start for " << diskPath;
+        return -EIO;
     }
     wr.reset();
     dev.reset();
@@ -278,9 +350,10 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out) {
  * Waits for fsvmd to end and, when it ended on its own while its volume is still mounted (its VM broke and no new
  * one came up), has the volume unmounted and reported as not opened.
  */
-static void Watch(unique_fd pidfd, std::string volumeId, pid_t pid) {
-    std::thread([pidfd = std::move(pidfd), volumeId, pid]() {
-        struct pollfd pfd = {pidfd.get(), POLLIN, 0};
+static void Watch(unique_fd conn, std::string volumeId, pid_t pid) {
+    std::thread([conn = std::move(conn), volumeId, pid]() {
+        // The service closes the connection once fsvmd ended. Answers are left for Reap to read.
+        struct pollfd pfd = {conn.get(), 0, 0};
         while (TEMP_FAILURE_RETRY(poll(&pfd, 1, -1)) != 1) {
         }
         std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
@@ -329,15 +402,14 @@ status_t Mount(Volume&& v, pid_t* pid) {
     pid_t child = Spawn(args, v.fd.get(), fuse.get(), readyWrite.get());
     if (child < 0) {
         int e = errno;
-        PLOG(ERROR) << "fsvm: fork";
+        LOG(ERROR) << "fsvm: fsvmd did not start for " << v.volumeId;
         umount2(v.target.c_str(), MNT_DETACH);
         return -e;
     }
     readyWrite.reset();
     v.fd.reset();
     fuse.reset();
-    // Opened before anyone can reap the child, so it always names this process.
-    unique_fd pidfd(static_cast<int>(syscall(__NR_pidfd_open, child, 0)));
+    unique_fd conn = Connection(child);
 
     struct pollfd pfd = {readyRead.get(), POLLIN, 0};
     char c = 0;
@@ -346,10 +418,10 @@ status_t Mount(Volume&& v, pid_t* pid) {
         LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child;
         *pid = child;
         if (!v.obb) sServing++;
-        if (pidfd >= 0) {
-            Watch(std::move(pidfd), v.volumeId, child);
+        if (conn >= 0) {
+            Watch(std::move(conn), v.volumeId, child);
         } else {
-            PLOG(WARNING) << "fsvm: no pidfd for fsvmd " << child;
+            PLOG(WARNING) << "fsvm: fsvmd " << child << " is not watched";
         }
         return OK;
     }
@@ -361,7 +433,8 @@ status_t Mount(Volume&& v, pid_t* pid) {
 
 void Stop(pid_t pid) {
     if (pid <= 0) return;
-    kill(pid, SIGTERM);
+    unique_fd conn = Connection(pid);
+    if (conn >= 0) Tell(conn.get(), 'T');
     if (Reap(pid, kStopMs) < 0) LOG(WARNING) << "fsvm: fsvmd " << pid << " killed";
 }
 
@@ -378,19 +451,19 @@ struct Guard::State {
     std::mutex lock;
     std::condition_variable cv;
     bool done = false;
-    unique_fd pidfd;
+    unique_fd conn;
 };
 
 Guard::Guard(pid_t pid, int ms) : mState(std::make_shared<State>()) {
-    // Through a pidfd, so that a process that ended and was reaped meanwhile can never be mistaken for another.
-    mState->pidfd.reset(static_cast<int>(syscall(__NR_pidfd_open, pid, 0)));
+    // Through fsvmd's connection to the service, which signals only its own child, never a reused pid.
+    mState->conn = Connection(pid);
     std::thread([state = mState, pid, ms]() {
         std::unique_lock<std::mutex> l(state->lock);
         if (!state->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return state->done; }) &&
-            state->pidfd >= 0) {
+            state->conn >= 0) {
             LOG(ERROR) << "fsvm: the mount steps after the VM took too long, stopping fsvmd " << pid;
             // Ends its FUSE connection, so the steps waiting on it fail at once.
-            syscall(__NR_pidfd_send_signal, state->pidfd.get(), SIGKILL, nullptr, 0);
+            Tell(state->conn.get(), 'K');
         }
     }).detach();
 }

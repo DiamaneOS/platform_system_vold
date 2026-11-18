@@ -170,9 +170,14 @@ void PublicVolume::removeTempPartition() {
 
 status_t PublicVolume::checkInVm() {
     // The filesystem check runs in the VM, as part of fsvmd's mount, with the same tools vold ran here before.
-    if (mFsType != "vfat" && mFsType != "exfat") {
-        LOG(ERROR) << getId() << ": the filesystem VM found no FAT or exFAT filesystem";
+    if (mPart.unread) {
+        LOG(ERROR) << getId() << ": the filesystem VM could not read this disk";
         mVmFailed = true;
+        return -EIO;
+    }
+    if (mFsType != "vfat" && mFsType != "exfat") {
+        // The VM read the volume and found nothing Android mounts: unsupported, with the format offer, as stock.
+        LOG(ERROR) << getId() << ": the filesystem VM found no FAT or exFAT filesystem";
         return -EIO;
     }
     return OK;
@@ -217,6 +222,10 @@ status_t PublicVolume::mountInVm(gid_t gid) {
 }
 
 status_t PublicVolume::formatInVm(const std::string& fsType) {
+    if (mPart.unread) {
+        LOG(ERROR) << getId() << ": the filesystem VM could not read this disk, not formatting it";
+        return -EIO;
+    }
     bool isVfatSup = vfat::IsSupported();
     bool isExfatSup = exfat::IsSupported();
     std::string pick;

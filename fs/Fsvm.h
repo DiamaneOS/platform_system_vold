@@ -37,6 +37,8 @@ namespace fsvm {
 
 /* A partition the filesystem VM read from a disk, as fsvmd checked it. Sectors are 512 bytes. */
 struct Part {
+    /* Only the placeholder of a disk the VM could not read: it says so, and is never mounted or formatted */
+    bool unread = false;
     enum class Class { kPublic, kMeta, kExpand };
     uint32_t index = 0; /* 0: a filesystem on the whole disk */
     Class cls = Class::kPublic;

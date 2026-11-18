@@ -316,6 +316,7 @@ void Disk::createUnopenableVolume() {
     mJustPartitioned = false;
     fsvm::Part whole;
     whole.length = mSize / 512;
+    whole.unread = true;
     createPublicVolumeInVm(whole);
 }
 
