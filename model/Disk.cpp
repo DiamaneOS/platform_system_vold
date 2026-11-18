@@ -267,13 +267,13 @@ void Disk::removeAddedPartitions() {
     mAddedPartitions.clear();
 }
 
-void Disk::createPublicVolumeInVm(const fsvm::Part& part) {
+bool Disk::createPublicVolumeInVm(const fsvm::Part& part) {
     // A crafted table can list many FAT partitions. Each served one holds a VM.
     static constexpr int kMaxPublicPerDisk = 4;
     if (mPublicVolumes >= kMaxPublicPerDisk) {
         LOG(WARNING) << mId << ": not serving partition " << part.index << ", " << kMaxPublicPerDisk
                      << " public volumes on this disk already";
-        return;
+        return false;
     }
     mPublicVolumes++;
     auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(mDevice, mDevPath, mSysPath, mSize, part));
@@ -289,6 +289,7 @@ void Disk::createPublicVolumeInVm(const fsvm::Part& part) {
     mVolumes.push_back(vol);
     vol->setDiskId(getId());
     vol->create();
+    return true;
 }
 
 bool Disk::createPrivateVolumeInVm(const fsvm::Part& part) {
@@ -372,10 +373,14 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     mProbedSize = mSize;
     mProbedAtMs = BootMs();
 
+    // Fail closed: a kernel that reads this disk's table itself (CONFIG_BLK_NO_EXTERNAL_PART_SCAN missing, dropped
+    // because the SD or MMC block driver is a module, or external_part_scan=1) gets no volume served from it.
     std::string partscan;
-    if (ReadFileToString(mSysPath + "/partscan", &partscan) && android::base::Trim(partscan) != "0") {
+    const bool kernelScans =
+            !ReadFileToString(mSysPath + "/partscan", &partscan) || android::base::Trim(partscan) != "0";
+    if (kernelScans) {
         LOG(ERROR) << mId << ": Android's kernel reads this disk's partition table "
-                   << "(CONFIG_BLK_NO_EXTERNAL_PART_SCAN is missing)";
+                   << "(CONFIG_BLK_NO_EXTERNAL_PART_SCAN is missing), not serving it";
     }
 
     destroyAllVolumes();
@@ -393,29 +398,33 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     // Android's kernel did not read the table and sgdisk does not either: the filesystem VM does. Partitions vold
     // added before, or a kernel without the option made, go first.
     fsvm::Layout layout;
-    mProbeFailed = fsvm::DeleteAllPartitions(mDevPath, mSysPath) != OK ||
+    mProbeFailed = kernelScans || fsvm::DeleteAllPartitions(mDevPath, mSysPath) != OK ||
                    fsvm::Probe(mDevPath, mSize, &layout) != OK;
     if (mProbeFailed) {
         LOG(ERROR) << mId << ": the filesystem VM could not read the disk";
         createUnopenableVolume();
         // A protected VM start can be refused for a while after boot: try twice more, later.
-        if (++mProbeFailures <= 2) ScheduleReprobe(getId(), mProbeFailures == 1 ? 15 : 60, false);
+        if (!kernelScans && ++mProbeFailures <= 2) {
+            ScheduleReprobe(getId(), mProbeFailures == 1 ? 15 : 60, false);
+        }
     } else {
         mProbeFailures = 0;
         // A mixed card (adoptable storage next to a public partition): each public partition is served through a
         // partition device of its own, so its VM never gets the adoptable storage.
         bool mixed = std::any_of(layout.parts.begin(), layout.parts.end(),
                                  [](const fsvm::Part& p) { return p.cls != fsvm::Part::Class::kPublic; });
+        bool skipped = false;
         for (const auto& part : layout.parts) {
             switch (part.cls) {
                 case fsvm::Part::Class::kPublic: {
                     if (part.index > static_cast<uint32_t>(maxMinors)) {
                         LOG(WARNING) << mId << ": partition " << part.index << " is beyond " << maxMinors;
+                        skipped = true;
                         break;
                     }
                     fsvm::Part pub = part;
                     pub.ownRange = mixed;
-                    createPublicVolumeInVm(pub);
+                    if (!createPublicVolumeInVm(pub)) skipped = true;
                     break;
                 }
                 case fsvm::Part::Class::kExpand:
@@ -426,6 +435,13 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
                 case fsvm::Part::Class::kMeta:
                     break;
             }
+        }
+        // Partitions that hold data but could not be served must not leave a disk without volumes: that would look
+        // blank and get the set-up (format) offer.
+        if (skipped && mVolumes.empty()) {
+            LOG(WARNING) << mId << ": no partition of this disk could be served";
+            createUnopenableVolume();
+            mProbeFailed = true;  // and the disk is not partitioned (formatted) either
         }
     }
 
@@ -653,6 +669,15 @@ status_t Disk::unmountAll() {
 status_t Disk::partitionPublic() {
     int res;
 
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // A disk the filesystem VM could not read is never partitioned (formatted), whoever asks: nothing showed that it
+    // holds no data.
+    if (isVmDisk() && mProbeFailed) {
+        LOG(WARNING) << mId << ": the filesystem VM could not read this disk, not partitioning it";
+        return -EBUSY;
+    }
+#endif
+
     destroyAllVolumes();
     mJustPartitioned = true;
 
@@ -704,6 +729,15 @@ status_t Disk::partitionPrivate() {
 
 status_t Disk::partitionMixed(int8_t ratio) {
     int res;
+
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // A disk the filesystem VM could not read is never partitioned (formatted), whoever asks: nothing showed that it
+    // holds no data.
+    if (isVmDisk() && mProbeFailed) {
+        LOG(WARNING) << mId << ": the filesystem VM could not read this disk, not partitioning it";
+        return -EBUSY;
+    }
+#endif
 
     destroyAllVolumes();
     mJustPartitioned = true;

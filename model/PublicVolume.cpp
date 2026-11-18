@@ -147,6 +147,8 @@ status_t PublicVolume::addTempPartition(std::string* path) {
         *path = mDiskDevPath;
         return OK;
     }
+    // A partition left from before (its VM still held it when it was to go) is removed first.
+    if (mTempAdded || !mTempNode.empty()) removeTempPartition();
     // fsck and the format tools need the partition as a device of its own. Android's kernel gets it for their run
     // only, at the range the VM read, and reads nothing from it itself.
     dev_t dev;
@@ -167,9 +169,18 @@ void PublicVolume::removeTempPartition() {
         DestroyDeviceNode(mTempNode);
         mTempNode.clear();
     }
-    if (mTempAdded && fsvm::DeletePartition(mDiskDevPath, mPart.index) == OK) {
-        mTempAdded = false;
+    // crosvm of a VM that just stopped may still hold the partition for a moment: try for 2 s.
+    for (int i = 0; mTempAdded && i < 20; i++) {
+        status_t res = fsvm::DeletePartition(mDiskDevPath, mPart.index);
+        if (res == OK || res == -ENXIO) {
+            mTempAdded = false;
+        } else if (res == -EBUSY) {
+            usleep(100 * 1000);
+        } else {
+            break;
+        }
     }
+    if (mTempAdded) LOG(WARNING) << getId() << ": partition " << mPart.index << " still in use, left in place";
 }
 
 status_t PublicVolume::checkInVm() {
@@ -252,8 +263,13 @@ status_t PublicVolume::mountInVm(gid_t gid) {
 
 void PublicVolume::stopInVm() {
     if (mFsvmdPid > 0) {
-        // Its FUSE mount is gone: fsvmd writes the volume back and unmounts it in the VM before it ends.
-        fsvm::Stop(mFsvmdPid, true);
+        // Its FUSE mount is gone: fsvmd writes the volume back and unmounts it in the VM before it ends. When that
+        // failed, or fsvmd had to be killed, the volume is not reported as safely unmounted.
+        int rc = fsvm::Stop(mFsvmdPid, true);
+        if (rc != 0) {
+            LOG(ERROR) << getId() << ": not everything may have been written back (" << rc << ")";
+            mWriteBackFailed = true;
+        }
         fsvm::Served(false, false);
     }
     mFsvmdPid = -1;
@@ -387,6 +403,7 @@ status_t PublicVolume::doMount() {
     // DiamaneOS: Android's kernel never mounts a FAT or exFAT volume. fsvmd serves it from a protected VM. If the VM
     // does not serve it, the volume is not mounted: there is no fallback to the kernel mount.
     mMountStartMs = systemTime(SYSTEM_TIME_BOOTTIME) / 1000000;
+    mWriteBackFailed = false;
     if (mountInVm(isVisible ? AID_MEDIA_RW : AID_EXTERNAL_STORAGE) != OK) {
         LOG(ERROR) << getId() << " was not served by the filesystem VM";
         mVmFailed = true;

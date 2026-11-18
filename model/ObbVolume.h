@@ -29,13 +29,16 @@ namespace vold {
  */
 class ObbVolume : public VolumeBase {
   public:
-    ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid);
+    /* `user`: the caller's user, from StorageManagerService (ownerGid is a shared app gid, the same in every user) */
+    ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid, userid_t user);
     virtual ~ObbVolume();
 
     void onFsvmdExit(pid_t pid) override;
 
     /* The OBB file vold opens (below /data/media, or below a public volume's /mnt/media_rw/<uuid>) */
     const std::string& getSourcePath() const { return mSourcePath; }
+    /* Asks its fsvmd to stop now, so that several OBB VMs end together (VolumeManager::unmountObbsBelow) */
+    void requestStop();
 
   protected:
     status_t doCreate() override;
@@ -46,6 +49,7 @@ class ObbVolume : public VolumeBase {
   private:
     std::string mSourcePath;
     gid_t mOwnerGid;
+    userid_t mUser;
 
     std::string mLoopPath;
 

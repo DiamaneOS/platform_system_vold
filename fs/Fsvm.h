@@ -93,10 +93,17 @@ status_t Mount(Volume&& v, pid_t* pid);
 
 /*
  * Stops fsvmd. `orderly`: its FUSE mount is gone, and fsvmd writes the volume back and unmounts it in the VM before
- * it ends (up to kSyncMs). Otherwise (a mount that failed, nothing written) it is stopped at once. Either way it is
- * gone after kSyncMs plus 3 s at most.
+ * it ends (up to kSyncMs, as long as the write back makes progress). Otherwise (a mount that failed, or a read-only
+ * volume with nothing to write) it is stopped at once. Either way it is gone after kSyncMs plus 3 s at most. Returns
+ * fsvmd's exit status (kExitNotWrittenBack when the write back failed), or -1 when it had to be killed.
  */
-void Stop(pid_t pid, bool orderly);
+int Stop(pid_t pid, bool orderly);
+
+/* fsvmd's exit status when it could not write the volume back before it ended (fsvmd main.rs EXIT_NOT_WRITTEN_BACK) */
+static constexpr int kExitNotWrittenBack = 3;
+
+/* Asks fsvmd to stop now, without waiting: Stop then reaps it. For stopping several at once. */
+void RequestStop(pid_t pid);
 
 /* Counts a serving fsvmd that ended (Mount counts the ones that start). */
 void Served(bool obb, bool starting);

@@ -40,6 +40,8 @@ namespace vold {
  */
 class PublicVolume : public VolumeBase {
   public:
+    /* The fsvmd serving this volume, or -1 (an OBB on the card guards its own steps with it) */
+    pid_t getFsvmdPid() const { return mFsvmdPid; }
     explicit PublicVolume(dev_t device);
     /* DiamaneOS: a partition the filesystem VM read from the whole disk `diskDevice` (phase 2) */
     PublicVolume(dev_t diskDevice, const std::string& diskDevPath, const std::string& diskSysPath,
@@ -60,6 +62,7 @@ class PublicVolume : public VolumeBase {
     status_t initAsecStage();
 
     bool mountFailedInVm() const override { return mVmFailed; }
+    bool writeBackFailed() const override { return mWriteBackFailed; }
     void onFsvmdExit(pid_t pid) override;
     status_t checkInVm();
     status_t mountInVm(gid_t gid);
@@ -95,6 +98,8 @@ class PublicVolume : public VolumeBase {
 
     /* fsvmd serving this volume from a protected VM, or -1 */
     pid_t mFsvmdPid = -1;
+    /* The last stop of fsvmd could not write the volume back (state kNotWrittenBack) */
+    bool mWriteBackFailed = false;
     /* When the current mount began (fsvm, NowMs), for the deadline of the steps after the VM served it */
     int64_t mMountStartMs = 0;
     /* Stops fsvmd, frees its serving slot and removes a mixed card's partition, on every way out of an unmount */

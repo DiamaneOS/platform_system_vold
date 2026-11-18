@@ -67,16 +67,22 @@ static constexpr char kService[] = "/dev/socket/fsvmd";
  *
  * - probe: fsvmd keeps to 20 s (PROBE_BUDGET), vold reads for at most 23 s, then Reap takes at most 4 s in all.
  *   At most 27 s.
+ * - OBB on a card: the open and its attributes go through the card's fsvmd, guarded for 8 s.
  * - mount: fsvmd keeps to 30 s (SERVE_BUDGET: VM starts, the check, the mount, the first free-space count), vold
  *   waits 33 s. The steps after it (MediaProvider's FUSE, bind mounts) end at the deadline PublicVolume's Guard
- *   sets: 48 s after the mount began, at least 8 s. A failed mount adds a stop of at most 3 s. At most 51 s.
- * - unmount: the steps before the stop get 15 s (a Guard ends fsvmd when FUSE requests hang), the orderly stop at
- *   most kSyncMs plus 3 s. At most 30 s.
+ *   sets: 48 s after the mount began, at least 15 s. A failure before the VM served adds a stop of at most 3 s
+ *   (51 s). A failure after it runs doUnmount, whose steps fail at once on the ended FUSE connection and whose stop
+ *   finds fsvmd ended: a few seconds more.
+ * - unmount: OBB images served from the card are stopped together first (3 s), the steps before the stop get 15 s
+ *   (a Guard ends fsvmd when FUSE requests hang), the orderly stop at most kSyncMs plus 3 s. At most 47 s.
  */
 static constexpr int kProbeTimeoutMs = 23000;
 static constexpr int kReadyTimeoutMs = 33000;
-/* After vold unmounted FUSE, fsvmd writes back and unmounts in the VM (fsvmd CLOSE_LOCK_WAIT plus CLOSE_BUDGET). */
-static constexpr int kSyncMs = 12000;
+/*
+ * After vold unmounted FUSE, fsvmd writes back and unmounts in the VM: 2 s for a call in progress, then as long as the
+ * VM's dirty data keeps going down, at most 22 s in all (fsvmd CLOSE_LOCK_WAIT and CLOSE_MAX).
+ */
+static constexpr int kSyncMs = 26000;
 /* After a stop request, then after a kill. */
 static constexpr int kTermMs = 2000;
 static constexpr int kKillMs = 1000;
@@ -469,15 +475,23 @@ status_t Mount(Volume&& v, pid_t* pid) {
     return -EIO;
 }
 
-void Stop(pid_t pid, bool orderly) {
-    if (pid <= 0) return;
+int Stop(pid_t pid, bool orderly) {
+    if (pid <= 0) return 0;
     int64_t t0 = NowMs();
     int rc = Reap(pid, orderly ? kSyncMs : 0, kTermMs);
     if (rc < 0) {
         LOG(WARNING) << "fsvm: fsvmd " << pid << " killed after " << NowMs() - t0 << " ms";
+    } else if (rc == kExitNotWrittenBack) {
+        LOG(ERROR) << "fsvm: fsvmd " << pid << " could not write its volume back (" << NowMs() - t0 << " ms)";
     } else {
         LOG(INFO) << "fsvm: fsvmd " << pid << " ended (" << rc << ") after " << NowMs() - t0 << " ms";
     }
+    return rc;
+}
+
+void RequestStop(pid_t pid) {
+    unique_fd conn = Connection(pid);
+    if (conn >= 0) Tell(conn.get(), 'T');
 }
 
 void Served(bool obb, bool starting) {

@@ -61,7 +61,8 @@ interface IVold {
     void fixupAppDir(@utf8InCpp String path, int appUid);
     void ensureAppDirsCreated(in @utf8InCpp String[] paths, int appUid);
 
-    @utf8InCpp String createObb(@utf8InCpp String sourcePath, int ownerGid);
+    // DiamaneOS: userId is the caller's user, which ownerGid (a shared app gid, the same in every user) does not hold.
+    @utf8InCpp String createObb(@utf8InCpp String sourcePath, int ownerGid, int userId);
     void destroyObb(@utf8InCpp String volId);
 
     void fstrim(int fstrimFlags, IVoldTaskListener listener);
@@ -186,6 +187,8 @@ interface IVold {
     const int VOLUME_STATE_BAD_REMOVAL = 8;
     // DiamaneOS: the filesystem VM could not open the volume. Not "unmountable": nothing says it is corrupted.
     const int VOLUME_STATE_UNOPENABLE = 9;
+    /* DiamaneOS: unmounted, but the filesystem VM could not write everything back to it first */
+    const int VOLUME_STATE_NOT_WRITTEN_BACK = 10;
 
     const int VOLUME_TYPE_PUBLIC = 0;
     const int VOLUME_TYPE_PRIVATE = 1;

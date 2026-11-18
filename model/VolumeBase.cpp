@@ -75,7 +75,8 @@ status_t VolumeBase::setPartGuid(const std::string& partGuid) {
 }
 
 status_t VolumeBase::setMountFlags(int mountFlags) {
-    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+    if ((mState != State::kUnmounted) && (mState != State::kUnmountable) &&
+        (mState != State::kUnopenable) && (mState != State::kNotWrittenBack)) {
         LOG(WARNING) << getId() << " flags change requires state unmounted or unmountable";
         return -EBUSY;
     }
@@ -85,7 +86,8 @@ status_t VolumeBase::setMountFlags(int mountFlags) {
 }
 
 status_t VolumeBase::setMountUserId(userid_t mountUserId) {
-    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+    if ((mState != State::kUnmounted) && (mState != State::kUnmountable) &&
+        (mState != State::kUnopenable) && (mState != State::kNotWrittenBack)) {
         LOG(WARNING) << getId() << " user change requires state unmounted or unmountable";
         return -EBUSY;
     }
@@ -225,7 +227,7 @@ status_t VolumeBase::doDestroy() {
 
 status_t VolumeBase::mount() {
     if ((mState != State::kUnmounted) && (mState != State::kUnmountable) &&
-        (mState != State::kUnopenable)) {
+        (mState != State::kUnopenable) && (mState != State::kNotWrittenBack)) {
         LOG(WARNING) << getId() << " mount requires state unmounted or unmountable";
         return -EBUSY;
     }
@@ -261,7 +263,8 @@ status_t VolumeBase::unmount() {
     mVolumes.clear();
 
     status_t res = doUnmount();
-    setState(State::kUnmounted);
+    // DiamaneOS: never "unmounted" (safe to remove) when the filesystem VM could not write the volume back.
+    setState(writeBackFailed() ? State::kNotWrittenBack : State::kUnmounted);
     return res;
 }
 

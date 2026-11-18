@@ -125,7 +125,7 @@ class Disk {
     /* DiamaneOS phase 2: SD cards and USB disks, whose tables only the filesystem VM reads */
     bool isVmDisk() const;
     status_t readPartitionsInVm(int maxMinors);
-    void createPublicVolumeInVm(const fsvm::Part& part);
+    bool createPublicVolumeInVm(const fsvm::Part& part);
     bool createPrivateVolumeInVm(const fsvm::Part& part);
     void createUnopenableVolume();
     void removeAddedPartitions();

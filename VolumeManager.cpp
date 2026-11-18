@@ -1181,8 +1181,9 @@ int VolumeManager::fixupAppDir(const std::string& path, int32_t appUid) {
     return setupAppDir(path, appUid, true /* fixupExistingOnly */);
 }
 
-int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
+int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid, int32_t userId,
                              std::string* outVolId) {
+    if (userId < 0) return -EINVAL;
     int id = mNextObbId++;
 
     std::string lowerSourcePath;
@@ -1220,7 +1221,7 @@ int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
     }
 
     auto vol = std::shared_ptr<android::vold::VolumeBase>(
-            new android::vold::ObbVolume(id, lowerSourcePath, ownerGid));
+            new android::vold::ObbVolume(id, lowerSourcePath, ownerGid, static_cast<userid_t>(userId)));
     vol->create();
 
     mObbVolumes.push_back(vol);
@@ -1230,12 +1231,18 @@ int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
 
 void VolumeManager::unmountObbsBelow(const std::string& path) {
     if (path.empty()) return;
+    std::vector<std::shared_ptr<android::vold::VolumeBase>> below;
     for (const auto& vol : mObbVolumes) {
         auto obb = std::static_pointer_cast<android::vold::ObbVolume>(vol);
         if (StartsWith(obb->getSourcePath(), path + "/") && vol->getState() == VolumeBase::State::kMounted) {
-            LOG(INFO) << vol->getId() << ": unmounting, its volume " << path << " goes";
-            vol->unmount();
+            below.push_back(vol);
+            // All of them are asked to stop first, so their VMs end together, not one after the other.
+            obb->requestStop();
         }
+    }
+    for (const auto& vol : below) {
+        LOG(INFO) << vol->getId() << ": unmounting, its volume " << path << " goes";
+        vol->unmount();
     }
 }
 
