@@ -38,12 +38,16 @@ namespace vold {
 class PrivateVolume : public VolumeBase {
   public:
     PrivateVolume(dev_t device, const KeyBuffer& keyRaw);
+    /* DiamaneOS: adoptable storage on a card whose table only the filesystem VM reads. `device` is a device-mapper
+     * range of the card, `idDevice` the partition's number, which the volume IDs keep as before */
+    PrivateVolume(dev_t device, dev_t idDevice, const KeyBuffer& keyRaw);
     virtual ~PrivateVolume();
     const std::string& getFsType() const { return mFsType; };
     const std::string& getRawDevPath() const { return mRawDevPath; };
     const std::string& getRawDmDevPath() const { return mDmDevPath; };
     const std::string& getFsUuid() const { return mFsUuid; };
-    dev_t getRawDevice() const { return mRawDevice; };
+    /* DiamaneOS: the number the volume IDs are made from (the raw device, but for a range of a card) */
+    dev_t getRawDevice() const { return mIdDevice; };
 
   protected:
     status_t doCreate() override;
@@ -58,6 +62,8 @@ class PrivateVolume : public VolumeBase {
   private:
     /* Kernel device of raw, encrypted partition */
     dev_t mRawDevice;
+    /* DiamaneOS: see getRawDevice */
+    dev_t mIdDevice;
     /* Path to raw, encrypted block device */
     std::string mRawDevPath;
     /* Path to decrypted block device */

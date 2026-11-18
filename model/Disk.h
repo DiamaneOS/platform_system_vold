@@ -128,7 +128,7 @@ class Disk {
     bool createPublicVolumeInVm(const fsvm::Part& part);
     bool createPrivateVolumeInVm(const fsvm::Part& part);
     void createUnopenableVolume();
-    void removeAddedPartitions();
+    void removeRanges();
     /* Asks every volume of the disk to start writing back, before they are stopped one by one */
     void prepareStopAll();
   public:
@@ -141,6 +141,8 @@ class Disk {
         kDeferred,
         /* a volume could not be opened: its VM did not start */
         kMountRetry,
+        /* the VM found nothing it can read: a second VM must answer the same before a format is offered */
+        kConfirm,
     };
     /* Reads the table again, later, when it is still worth it (DiskFsvm.cpp) */
     void reprobeInVm(Reprobe why);
@@ -161,8 +163,13 @@ class Disk {
     int64_t mProbedAtMs = 0;
     bool mReprobePending = false;
     int mPublicVolumes = 0;
-    /* Partitions vold added to Android's kernel (adoptable storage) */
-    std::vector<uint32_t> mAddedPartitions;
+    /* Device-mapper ranges of the card the disk set up itself (adoptable storage), by name */
+    std::vector<std::string> mRanges;
+    /* An answer that would offer a format, waiting for a second VM's (Reprobe::kConfirm) */
+    bool mVerdictPending = false;
+    bool mConfirmScheduled = false;
+    bool mConfirmProbe = false;
+    fsvm::Layout mVerdict;
 
     void destroyAllVolumes();
 

@@ -49,11 +49,13 @@ struct Part {
     std::string partGuid; /* GPT unique partition GUID as sgdisk printed it, or empty */
     std::string label;
     uint64_t metaBytes = 0; /* metadata the filesystem keeps in memory, sizes the VM */
+    /* The VM found a FAT or exFAT boot sector that fails its checks: could not be opened, never formatted */
+    bool damaged = false;
     /*
-     * The disk also holds adoptable storage (a mixed card): this public partition is served through a partition
-     * device of its own, so the VM gets only its range and never the adoptable storage next to it.
+     * Two probes in a row, each from its own VM, answered the same that this partition holds no filesystem the VM
+     * can read (a new card, ext4, NTFS). Only such a partition is offered for formatting.
      */
-    bool ownRange = false;
+    bool noFsConfirmed = false;
 };
 
 struct Layout {
@@ -73,6 +75,15 @@ status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out, u
 
 /* The logical block size of a block device (512 or 4096), or 0. */
 uint32_t BlockSize(int fd);
+
+/*
+ * Whether a probe's answer would offer the user a format: a public partition the VM read and found no filesystem it
+ * can read on (not a damaged FAT or exFAT), or nothing on the disk Android can use. Such an answer counts only when a
+ * second probe, from a new VM, gives the same answer (SameLayout).
+ */
+bool OffersFormat(const Layout& l);
+/* Whether two probes of a disk gave the same answer, every field of every partition. */
+bool SameLayout(const Layout& a, const Layout& b);
 
 struct Volume {
     android::base::unique_fd fd; /* the whole disk, or the OBB file */
@@ -136,11 +147,20 @@ class Guard {
 };
 
 /*
- * Adds partition `p` of a disk whose table Android's kernel does not read, at the range the VM read. Returns its
- * device in `dev`, and `added` true once the kernel has the partition.
+ * A device-mapper range of a disk whose table Android's kernel does not read: a dm-linear device over exactly sectors
+ * `start` to `start + length` of `disk`, the range the VM read. A partition's VM, its format and adoptable storage get
+ * such a range instead of the whole disk, so one partition's VM cannot reach another. The kernel reads no table on
+ * it (device-mapper disks carry GENHD_FL_NO_PART). Returns vold's node for it (/dev/block/vold/<name>, labelled
+ * vold_device like the disk's) in `node` and its device in `dev`.
  */
-status_t AddPartition(const std::string& diskPath, const std::string& diskSysPath, const Part& p, dev_t* dev,
-                      bool* added);
+std::string RangeName(dev_t disk, uint32_t index);
+status_t CreateRange(const std::string& name, dev_t disk, uint64_t start, uint64_t length, bool readOnly,
+                     std::string* node, dev_t* dev = nullptr);
+/* Removes a range and its node. Waits up to 10 s while a VM that just stopped still holds it. */
+status_t DeleteRange(const std::string& name, const std::string& node);
+/* Removes every range of `disk` left from before (vold restarted, a medium changed). */
+void DeleteRangesOf(dev_t disk);
+
 status_t DeletePartition(const std::string& diskPath, uint32_t index);
 /*
  * Removes every partition Android's kernel has for the disk: ones vold added earlier, and on a kernel without

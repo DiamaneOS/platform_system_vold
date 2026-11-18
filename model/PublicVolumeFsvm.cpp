@@ -29,6 +29,7 @@
 #include "fs/Vfat.h"
 
 #include <android-base/logging.h>
+#include <android-base/unique_fd.h>
 #include <android-base/stringprintf.h>
 #include <utils/Timers.h>
 
@@ -59,45 +60,31 @@ PublicVolume::PublicVolume(dev_t diskDevice, const std::string& diskDevPath, con
     mDiskBytes = diskBytes;
 }
 
-status_t PublicVolume::addTempPartition(std::string* path) {
+status_t PublicVolume::createRange(bool readOnly, std::string* path) {
     if (mPart.index == 0) {
+        // A filesystem on the whole disk: the disk holds nothing else.
         *path = mDiskDevPath;
         return OK;
     }
-    // A partition left from before (its VM still held it when it was to go) is removed first.
-    if (mTempAdded || !mTempNode.empty()) removeTempPartition();
-    // fsck and the format tools need the partition as a device of its own. Android's kernel gets it for their run
-    // only, at the range the VM read, and reads nothing from it itself.
-    dev_t dev;
-    status_t res = fsvm::AddPartition(mDiskDevPath, mDiskSysPath, mPart, &dev, &mTempAdded);
+    // A range left from before (its VM still held it when it was to go) is removed first.
+    if (!mRangeName.empty()) removeRange();
+    // The VM, fsck and the format tools get exactly this partition's sectors, as a device-mapper range of the disk.
+    // Android's kernel reads nothing from it and adds no partition to the disk.
+    std::string name = fsvm::RangeName(mDevice, mPart.index);
+    status_t res = fsvm::CreateRange(name, mDevice, mPart.start, mPart.length, readOnly, &mRangeNode);
     if (res != OK) return res;
-    mTempNode = StringPrintf("/dev/block/vold/%s", getId().c_str());
-    res = CreateDeviceNode(mTempNode, dev);
-    if (res != OK) {
-        removeTempPartition();
-        return res;
-    }
-    *path = mTempNode;
+    mRangeName = name;
+    *path = mRangeNode;
     return OK;
 }
 
-void PublicVolume::removeTempPartition() {
-    if (!mTempNode.empty()) {
-        DestroyDeviceNode(mTempNode);
-        mTempNode.clear();
+void PublicVolume::removeRange() {
+    if (mRangeName.empty()) return;
+    if (fsvm::DeleteRange(mRangeName, mRangeNode) != OK) {
+        LOG(WARNING) << getId() << ": range " << mRangeName << " still in use, left in place";
     }
-    // crosvm of a VM that just stopped may still hold the partition for a moment: try for 2 s.
-    for (int i = 0; mTempAdded && i < 20; i++) {
-        status_t res = fsvm::DeletePartition(mDiskDevPath, mPart.index);
-        if (res == OK || res == -ENXIO) {
-            mTempAdded = false;
-        } else if (res == -EBUSY) {
-            usleep(100 * 1000);
-        } else {
-            break;
-        }
-    }
-    if (mTempAdded) LOG(WARNING) << getId() << ": partition " << mPart.index << " still in use, left in place";
+    mRangeName.clear();
+    mRangeNode.clear();
 }
 
 status_t PublicVolume::checkInVm() {
@@ -110,9 +97,21 @@ status_t PublicVolume::checkInVm() {
             mVmFailed = true;
             return -EIO;
         }
+        if (mPart.damaged) {
+            // A FAT or exFAT the VM found damaged: could not be opened, never offered for formatting.
+            LOG(ERROR) << getId() << ": the filesystem VM found a damaged FAT or exFAT boot sector";
+            mVmFailed = true;
+            return -EIO;
+        }
         if (mFsType != "vfat" && mFsType != "exfat") {
-            // The VM read the volume and found nothing Android mounts: unsupported, with the format offer, as stock.
-            LOG(ERROR) << getId() << ": the filesystem VM found no FAT or exFAT filesystem";
+            if (mPart.noFsConfirmed) {
+                // Two VMs in a row read the volume and found no filesystem they can read: unmountable, with
+                // Android's own format offer, as stock.
+                LOG(ERROR) << getId() << ": the filesystem VM found no FAT or exFAT filesystem, twice";
+                return -EIO;
+            }
+            LOG(ERROR) << getId() << ": no filesystem, not confirmed by a second probe";
+            mVmFailed = true;
             return -EIO;
         }
     } else if (mFsType == "vfat") {
@@ -145,36 +144,57 @@ void PublicVolume::onFsvmdExit(pid_t pid) {
     setUnopenable();
 }
 
+void PublicVolume::onCheckDone(pid_t pid, bool writable) {
+    if (pid != mFsvmdPid || getState() != State::kMounted) return;
+    if (writable) {
+        // Apps got EROFS during the check. Nothing to tell the framework, the volume was reported mounted.
+        LOG(INFO) << getId() << ": checked in the filesystem VM, writable now";
+        announceReadOnly(false);
+    } else {
+        // A check that failed keeps the volume read-only: reported so, with SystemUI's read-only notice.
+        LOG(WARNING) << getId() << ": the check in the filesystem VM did not pass, it stays read-only";
+        announceReadOnly(true);
+    }
+}
+
 status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
     fsvm::Volume v;
     std::string path = mInVm ? mDiskDevPath : mDevPath;
-    // A mixed card: the VM gets this partition only, never the adoptable storage next to it.
-    bool ownRange = mInVm && mPart.ownRange && mPart.index > 0;
-    if (ownRange) {
-        status_t res = addTempPartition(&path);
+    // A card with its write-protect switch on, as the kernel mount handled it: served read-only, through a
+    // read-only range.
+    bool readOnly = false;
+    if (mInVm) {
+        android::base::unique_fd probe(TEMP_FAILURE_RETRY(open(mDiskDevPath.c_str(), O_RDWR | O_CLOEXEC)));
+        readOnly = probe < 0 && (errno == EROFS || errno == EACCES);
+    }
+    // A partition: its VM gets exactly its range, never the whole disk, so it cannot reach another partition or the
+    // adoptable storage next to it.
+    const bool range = mInVm && mPart.index > 0;
+    if (range) {
+        status_t res = createRange(readOnly, &path);
         if (res != OK) {
-            LOG(ERROR) << getId() << ": no partition device of its own on this mixed card (" << res << ")";
+            LOG(ERROR) << getId() << ": no range of its own (" << res << ")";
             return res;
         }
     }
-    v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDWR | O_CLOEXEC)));
-    if (v.fd < 0 && (errno == EROFS || errno == EACCES)) {
-        // A card with its write-protect switch on, as the kernel mount handled it: served read-only.
-        v.readOnly = true;
+    v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC)));
+    if (v.fd < 0 && !readOnly && (errno == EROFS || errno == EACCES)) {
+        readOnly = true;
         v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
     }
+    v.readOnly = readOnly;
     if (v.fd < 0) {
         int e = errno;
         PLOG(ERROR) << getId() << ": opening " << path;
-        if (ownRange) removeTempPartition();
+        if (range) removeRange();
         return -e;
     }
     v.blockSize = fsvm::BlockSize(v.fd.get());
     if (!v.blockSize) {
-        if (ownRange) removeTempPartition();
+        if (range) removeRange();
         return -EINVAL;
     }
-    if (ownRange) {
+    if (range) {
         // The partition alone, as a disk of its own: the filesystem starts at its first sector.
         v.diskBytes = mPart.length * 512;
         v.part = mPart;
@@ -196,7 +216,7 @@ status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
     v.volumeId = getId();
     v.target = mRawPath;
     status_t res = fsvm::Mount(std::move(v), &mFsvmdPid, servedReadOnly);
-    if (res != OK && ownRange) removeTempPartition();
+    if (res != OK && range) removeRange();
     return res;
 }
 
@@ -209,8 +229,10 @@ status_t PublicVolume::mountInVm(gid_t gid) {
         rmdir(mRawPath.c_str());
         return -EIO;
     }
-    // A volume marked dirty whose check did not finish in time is served read-only. The user gets a notice.
-    if (servedReadOnly) LOG(WARNING) << getId() << ": served read-only, its check did not finish";
+    // Served read-only by the VM (a write-protected card, or its driver found an error): the user gets a notice. A
+    // volume marked dirty is served read-only while the VM checks it after the mount, and reported mounted: apps get
+    // EROFS until the check passed (onCheckDone).
+    if (servedReadOnly) LOG(WARNING) << getId() << ": served read-only by the filesystem VM";
     setReportReadOnly(servedReadOnly);
     return OK;
 }
@@ -234,12 +256,12 @@ void PublicVolume::stopInVm() {
         fsvm::Served(false, false);
     }
     mFsvmdPid = -1;
-    if (mPart.ownRange) removeTempPartition();
+    removeRange();
 }
 
 status_t PublicVolume::formatInVm(const std::string& fsType) {
-    if (mPart.unread) {
-        LOG(ERROR) << getId() << ": the filesystem VM could not read this disk, not formatting it";
+    if (mPart.unread || mPart.damaged) {
+        LOG(ERROR) << getId() << ": the filesystem VM could not read this volume, not formatting it";
         return -EIO;
     }
     bool isVfatSup = vfat::IsSupported();
@@ -262,16 +284,16 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
         return -EINVAL;
     }
     std::string dev;
-    status_t res = addTempPartition(&dev);
+    status_t res = createRange(false, &dev);
     if (res != OK) {
-        LOG(ERROR) << getId() << " has no partition device to format";
+        LOG(ERROR) << getId() << " has no range to format";
         return res;
     }
     if (WipeBlockDevice(dev) != OK) {
         LOG(WARNING) << getId() << " failed to wipe";
     }
     res = pick == "vfat" ? vfat::Format(dev, 0) : exfat::Format(dev);
-    removeTempPartition();
+    removeRange();
     if (res != OK) {
         LOG(ERROR) << getId() << " failed to format";
         return -EIO;
@@ -282,6 +304,7 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
     mPart.fsUuid.clear();
     mPart.label.clear();
     mPart.metaBytes = 0;
+    mPart.noFsConfirmed = false;
     // One probe only, of at most 10 s: vold holds its lock for the wipe and the format already, and after a
     // partitioning for the probe of the new table too.
     fsvm::Layout layout;

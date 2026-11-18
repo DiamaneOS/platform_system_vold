@@ -66,6 +66,7 @@ class PublicVolume : public VolumeBase {
     bool mountFailedInVm() const override { return mVmFailed; }
     bool writeBackFailed() const override { return mWriteBackFailed; }
     void onFsvmdExit(pid_t pid) override;
+    void onCheckDone(pid_t pid, bool writable) override;
     void onMountFailed() override;
     void doPostMount() override;
     /* DiamaneOS: the steps of doMount around the filesystem VM (PublicVolumeFsvm.cpp) */
@@ -74,8 +75,9 @@ class PublicVolume : public VolumeBase {
     status_t serveInVm(gid_t gid, bool* servedReadOnly);
     int guardMs() const;
     status_t formatInVm(const std::string& fsType);
-    status_t addTempPartition(std::string* path);
-    void removeTempPartition();
+    /* A device-mapper range of exactly this partition (fs/Fsvm.h CreateRange), or the disk for index 0 */
+    status_t createRange(bool readOnly, std::string* path);
+    void removeRange();
 
   private:
     /* Kernel device representing partition */
@@ -109,7 +111,7 @@ class PublicVolume : public VolumeBase {
     bool mWriteBackFailed = false;
     /* When the current mount began (fsvm, NowMs), for the deadline of the steps after the VM served it */
     int64_t mMountStartMs = 0;
-    /* Stops fsvmd, frees its serving slot and removes a mixed card's partition, on every way out of an unmount */
+    /* Stops fsvmd, frees its serving slot and removes the partition's range, on every way out of an unmount */
     void stopInVm();
 
     /* DiamaneOS phase 2: the partition the VM read, on the whole disk at mDiskDevPath */
@@ -120,9 +122,9 @@ class PublicVolume : public VolumeBase {
     uint64_t mDiskBytes = 0;
     /* Set when the last mount failed in the filesystem VM */
     bool mVmFailed = false;
-    /* A partition device added for fsck or format, removed again afterwards */
-    std::string mTempNode;
-    bool mTempAdded = false;
+    /* The partition's device-mapper range while its VM or a format uses it (dm name and vold's node) */
+    std::string mRangeName;
+    std::string mRangeNode;
 
     DISALLOW_COPY_AND_ASSIGN(PublicVolume);
 };

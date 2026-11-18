@@ -120,7 +120,7 @@ status_t PublicVolume::doCreate() {
 
 status_t PublicVolume::doDestroy() {
     if (mInVm) {
-        removeTempPartition();
+        removeRange();
         return OK;
     }
     return DestroyDeviceNode(mDevPath);

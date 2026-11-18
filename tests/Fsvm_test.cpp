@@ -15,8 +15,12 @@
  */
 
 #include <gtest/gtest.h>
+#include <sys/sysmacros.h>
 
 #include "../fs/Fsvm.h"
+
+// vold's main.cpp defines it, and CreateRange refers to it through CreateDeviceNode. The tests never get that far.
+struct selabel_handle* sehandle;
 
 namespace android {
 namespace vold {
@@ -99,6 +103,69 @@ TEST(FsvmTest, LogicalPartitionsAndBlockSizes) {
     EXPECT_EQ(OK, ParseLayout(gpt(kDisk / 512 - 133, 100), kDisk, &l, 512));
     EXPECT_NE(OK, ParseLayout(gpt(kDisk / 512 - 133, 100), kDisk, &l, 4096));
     EXPECT_NE(OK, ParseLayout(gpt(48, 100), kDisk, &l, 1024));
+}
+
+TEST(FsvmTest, DamagedAndUnreadable) {
+    Layout l;
+    // A damaged FAT or exFAT boot sector, on a partition or on the whole disk.
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 1 public 2048 4096 bad - - 0 -\nEND\n", kDisk, &l));
+    EXPECT_TRUE(l.parts[0].damaged);
+    EXPECT_TRUE(l.parts[0].fsType.empty());
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 none 1\nPART 0 public 0 1000 bad - - 0 -\nEND\n", kDisk, &l));
+    EXPECT_TRUE(l.parts[0].damaged);
+    // A whole-disk entry without a filesystem, and "bad" on adoptable storage, are refused.
+    EXPECT_NE(OK, ParseLayout("LAYOUT 1 none 1\nPART 0 public 0 1000 - - - 0 -\nEND\n", kDisk, &l));
+    EXPECT_NE(OK, ParseLayout("LAYOUT 1 gpt 1\nPART 2 expand 2048 10 bad - 01010101-0101-0101-0101-010101010101 0 "
+                              "-\nEND\n",
+                              kDisk, &l));
+}
+
+TEST(FsvmTest, OnlyTwoEqualAnswersOfferAFormat) {
+    Layout blank, ntfs, fat, mixed, damaged, adopted, other;
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 none 0\nEND\n", kDisk, &blank));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 1 public 2048 4096 - - - 0 -\nEND\n", kDisk, &ntfs));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 1 public 2048 4096 vfat - - 0 -\nEND\n", kDisk, &fat));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 2\nPART 1 public 2048 4096 vfat - - 0 -\n"
+                              "PART 2 public 8192 4096 - - - 0 -\nEND\n",
+                              kDisk, &mixed));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 1 public 2048 4096 bad - - 0 -\nEND\n", kDisk, &damaged));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 gpt 2\nPART 1 meta 2048 2048 - - 02020202-0202-0202-0202-020202020202 0 -\n"
+                              "PART 2 expand 4096 100000 - - 03030303-0303-0303-0303-030303030303 0 -\nEND\n",
+                              kDisk, &adopted));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 1 public 2048 4097 - - - 0 -\nEND\n", kDisk, &other));
+    // Nothing usable, or a public partition without a filesystem: a format offer, once confirmed.
+    EXPECT_TRUE(OffersFormat(blank));
+    EXPECT_TRUE(OffersFormat(ntfs));
+    EXPECT_TRUE(OffersFormat(mixed));
+    // A readable card, a damaged FAT and adoptable storage never offer one.
+    EXPECT_FALSE(OffersFormat(fat));
+    EXPECT_FALSE(OffersFormat(damaged));
+    EXPECT_FALSE(OffersFormat(adopted));
+    // Two answers count only when they are the same in every field.
+    EXPECT_TRUE(SameLayout(ntfs, ntfs));
+    EXPECT_TRUE(SameLayout(blank, blank));
+    EXPECT_FALSE(SameLayout(ntfs, other));
+    EXPECT_FALSE(SameLayout(ntfs, blank));
+    EXPECT_FALSE(SameLayout(ntfs, fat));
+    Layout unread = ntfs;
+    unread.parts[0].unread = true;
+    EXPECT_FALSE(SameLayout(unread, unread));
+}
+
+TEST(FsvmTest, RangeNames) {
+    EXPECT_EQ("fsvm-179-0-1", RangeName(makedev(179, 0), 1));
+    EXPECT_EQ("fsvm-8-16-36", RangeName(makedev(8, 16), 36));
+}
+
+TEST(FsvmTest, RangesRefuseHostileNumbers) {
+    // Ranges come only from a layout ParseLayout accepted (inside the disk, no overlaps). CreateRange itself still
+    // refuses an empty range and one whose end wraps, before device-mapper sees anything. The kernel's dm-linear
+    // refuses a range past the end of the disk.
+    std::string node = "x";
+    EXPECT_EQ(-EINVAL, CreateRange("fsvm-test-0", makedev(179, 0), 2048, 0, false, &node));
+    EXPECT_TRUE(node.empty());
+    EXPECT_EQ(-EINVAL, CreateRange("fsvm-test-0", makedev(179, 0), UINT64_MAX / 512, 2, false, &node));
+    EXPECT_EQ(-EINVAL, CreateRange("fsvm-test-0", makedev(179, 0), UINT64_MAX - 1, 2, true, &node));
 }
 
 TEST(FsvmTest, ProbesShareALimit) {

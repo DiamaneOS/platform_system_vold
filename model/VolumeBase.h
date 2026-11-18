@@ -114,6 +114,8 @@ class VolumeBase {
 
     /* DiamaneOS: the fsvmd serving this volume ended on its own (vold's lock is held) */
     virtual void onFsvmdExit(pid_t pid) {}
+    /* DiamaneOS: the VM's check after the mount ended: writable now, or it stays read-only (vold's lock is held) */
+    virtual void onCheckDone(pid_t pid, bool writable) {}
     /* DiamaneOS: the volume is about to go with others of its disk: start writing it back now (PublicVolume) */
     virtual void prepareStop() {}
 
@@ -149,6 +151,8 @@ class VolumeBase {
     virtual void onMountFailed() {}
     /* DiamaneOS: report a mounted volume as mounted read-only (the filesystem VM served it read-only) */
     void setReportReadOnly(bool readOnly) { mReportReadOnly = readOnly; }
+    /* DiamaneOS: the same for a volume mounted already: the framework hears of it at once */
+    void announceReadOnly(bool readOnly);
     /* DiamaneOS: after an unmount, reports the volume as not opened */
     void setUnopenable();
 

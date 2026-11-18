@@ -21,6 +21,7 @@
 #include <android-base/parseint.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <libdm/dm.h>
 #include <private/android_filesystem_config.h>
 
 #include <dirent.h>
@@ -34,6 +35,7 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/un.h>
@@ -41,6 +43,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <iterator>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -49,6 +52,8 @@
 #include <mutex>
 #include <thread>
 
+#include "DmWait.h"
+#include "Utils.h"
 #include "VolumeManager.h"
 #include "model/VolumeBase.h"
 
@@ -61,7 +66,16 @@ namespace android {
 namespace vold {
 namespace fsvm {
 
-static constexpr char kService[] = "/dev/socket/fsvmd";
+/*
+ * One fsvmd service per slot, each with a user of its own (vendor/diamaneos fsvm/fsvmd.rc and config.fs): one probe,
+ * kMaxServing served volumes and four OBB images (ObbVolumeFsvm.cpp kMaxObbVms) at a time. A slot runs one fsvmd and
+ * refuses a second request (EBUSY), so vold asks the next one. scripts/p3-slots-check.py checks that these lists,
+ * fsvmd.rc and config.fs agree.
+ */
+static constexpr char kServicePrefix[] = "/dev/socket/fsvmd_";
+static const char* const kProbeSlots[] = {"probe"};
+static const char* const kVolumeSlots[] = {"0", "1", "2", "3", "4", "5"};
+static const char* const kObbSlots[] = {"obb_0", "obb_1", "obb_2", "obb_3"};
 /*
  * vold holds its lock while it waits, and system_server's watchdog asks for that lock (60 s). Every wait is bounded:
  *
@@ -70,8 +84,9 @@ static constexpr char kService[] = "/dev/socket/fsvmd";
  *   keep vold starting VMs.
  * - format: the wipe and the format tool, then one probe of at most 10 s (plus 1 s for the kill), never the 27 s.
  * - OBB on a card: the open and its attributes go through the card's fsvmd, guarded for 8 s.
- * - mount: fsvmd keeps to 34 s (SERVE_BUDGET: VM starts, the check of up to 18 s, the mount, the first
- *   free-space count), vold waits 37 s. The steps after it (MediaProvider's FUSE, bind mounts) end at the deadline
+ * - mount: fsvmd keeps to 34 s (SERVE_BUDGET: VM starts, the mount, the first free-space count), vold waits 37 s.
+ *   A volume marked dirty is mounted read-only and checked in the VM afterwards, outside the lock (fsvmd fs.rs
+ *   Checker): the check is not part of the mount any more. The steps after it (MediaProvider's FUSE, bind mounts) end at the deadline
  *   PublicVolume's Guard sets: 52 s after the mount began, at least 15 s. A failure before the VM served adds a stop
  *   of at most 3 s (55 s). A failure after it runs doUnmount, whose steps fail at once on the ended FUSE connection and whose stop
  *   finds fsvmd ended: a few seconds more.
@@ -94,6 +109,7 @@ static constexpr int kKillMs = 1000;
 static constexpr int kStartMs = 3000;
 /* Serving VMs at a time, OBB images excluded (ObbVolume has its own caps). */
 static constexpr int kMaxServing = 6;
+static_assert(std::size(kVolumeSlots) == kMaxServing, "one fsvmd slot per served volume");
 static std::atomic<int> sServing{0};
 static constexpr size_t kMaxProbeOutput = 4096;
 static constexpr size_t kMaxParts = 16;
@@ -127,16 +143,17 @@ static bool ReadAnswer(int fd, int ms, char* kind, uint64_t* value) {
     return ParseUint(buf + 2, value, static_cast<uint64_t>(INT32_MAX));
 }
 
-/* Has the service run fsvmd with exactly the descriptors given as 3, 4 and 5 (-1: none). Returns its pid, or -1. */
-static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
+/* Has slot `slot`'s service run fsvmd with exactly the descriptors given as 3, 4 and 5 (-1: none). Returns its pid,
+ * or -1 with errno set (EBUSY: the slot runs a fsvmd already). */
+static pid_t SpawnOn(const char* slot, const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
     // Not blocking: a service that is not accepting (stopped, restarting) refuses at once instead of holding vold.
     unique_fd s(socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (s < 0) return -1;
     struct sockaddr_un addr = {};
     addr.sun_family = AF_UNIX;
-    strlcpy(addr.sun_path, kService, sizeof(addr.sun_path));
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s%s", kServicePrefix, slot);
     if (TEMP_FAILURE_RETRY(connect(s.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)))) {
-        PLOG(ERROR) << "fsvm: the fsvmd service is not there";
+        PLOG(ERROR) << "fsvm: the fsvmd_" << slot << " service is not there";
         return -1;
     }
     std::string msg("FSVMD1", 6);
@@ -180,15 +197,32 @@ static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int f
     char kind = 0;
     uint64_t value = 0;
     if (!ReadAnswer(s.get(), kStartMs, &kind, &value) || kind != 'P' || value == 0) {
-        LOG(ERROR) << "fsvm: the fsvmd service did not start fsvmd ("
-                   << (kind == 'E' ? strerror(static_cast<int>(value)) : "no answer") << ")";
         errno = kind == 'E' ? static_cast<int>(value) : EIO;
+        if (errno != EBUSY) {
+            LOG(ERROR) << "fsvm: the fsvmd_" << slot << " service did not start fsvmd ("
+                       << (kind == 'E' ? strerror(static_cast<int>(value)) : "no answer") << ")";
+        }
         return -1;
     }
     pid_t pid = static_cast<pid_t>(value);
     std::lock_guard<std::mutex> lock(sChildrenLock);
     sChildren[pid] = std::move(s);
     return pid;
+}
+
+/* The first free slot of the request's kind (a probe, an OBB image or a volume) runs fsvmd. */
+static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
+    const bool probe = !args.empty() && args[0] == "--probe", obb = !args.empty() && args[0] == "--obb";
+    const char* const* slots = probe ? kProbeSlots : obb ? kObbSlots : kVolumeSlots;
+    size_t n = probe ? std::size(kProbeSlots) : obb ? std::size(kObbSlots) : std::size(kVolumeSlots);
+    for (size_t i = 0; i < n; i++) {
+        pid_t pid = SpawnOn(slots[i], args, fd3, fd4, fd5);
+        if (pid > 0) return pid;
+        if (errno != EBUSY && errno != ECONNREFUSED && errno != ENOENT && errno != EAGAIN) return -1;
+    }
+    LOG(ERROR) << "fsvm: no free fsvmd slot for " << (probe ? "a probe" : obb ? "an OBB image" : "a volume");
+    errno = EBUSY;
+    return -1;
 }
 
 /* A second descriptor of fsvmd `pid`'s connection, for a thread that outlives vold's own (Watch, Guard). */
@@ -310,7 +344,9 @@ status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out, u
         else if (f[2] == "expand") p.cls = Part::Class::kExpand;
         else return -EINVAL;
         if (p.length == 0 || p.start > sectors || p.length > sectors - p.start) return -EINVAL;
+        // "bad": a FAT or exFAT boot sector that fails the VM's checks.
         if (f[5] == "vfat" || f[5] == "exfat") p.fsType = f[5];
+        else if (f[5] == "bad") p.damaged = true;
         else if (f[5] != "-") return -EINVAL;
         if (IsUuid(f[6])) p.fsUuid = f[6];
         else if (f[6] != "-") return -EINVAL;
@@ -326,7 +362,9 @@ status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out, u
              p.start + p.length > sectors - gptTail)) {
             return -EINVAL;
         }
-        if (p.cls != Part::Class::kPublic && !p.fsType.empty()) return -EINVAL;
+        if (p.cls != Part::Class::kPublic && (!p.fsType.empty() || p.damaged)) return -EINVAL;
+        // A whole-disk entry names a filesystem, sound or damaged (a blank disk has no entry).
+        if (p.index == 0 && p.fsType.empty() && !p.damaged) return -EINVAL;
         for (const auto& q : out->parts) {
             if (q.index == p.index || (q.cls == p.cls && p.cls != Part::Class::kPublic)) return -EINVAL;
             if (p.start < q.start + q.length && q.start < p.start + p.length) return -EINVAL;
@@ -334,6 +372,30 @@ status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out, u
         out->parts.push_back(p);
     }
     return OK;
+}
+
+bool OffersFormat(const Layout& l) {
+    bool usable = false;
+    for (const auto& p : l.parts) {
+        if (p.cls == Part::Class::kExpand || p.damaged) usable = true;
+        if (p.cls != Part::Class::kPublic) continue;
+        if (!p.fsType.empty()) usable = true;
+        else if (!p.damaged) return true;
+    }
+    return !usable;
+}
+
+bool SameLayout(const Layout& a, const Layout& b) {
+    if (a.table != b.table || a.parts.size() != b.parts.size()) return false;
+    for (size_t i = 0; i < a.parts.size(); i++) {
+        const Part &p = a.parts[i], &q = b.parts[i];
+        if (p.unread || q.unread || p.index != q.index || p.cls != q.cls || p.start != q.start ||
+            p.length != q.length || p.fsType != q.fsType || p.fsUuid != q.fsUuid || p.partGuid != q.partGuid ||
+            p.label != q.label || p.metaBytes != q.metaBytes || p.damaged != q.damaged) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Reads everything fsvmd writes to `fd` until it closes, within `deadline` (NowMs). */
@@ -364,6 +426,9 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
         LOG(ERROR) << "fsvm: " << diskPath << " has a logical block size the VM does not take";
         return -EINVAL;
     }
+    // Writes through a range (a format, a VM with O_DIRECT) bypass the disk's own page cache: the VM must read the
+    // disk as it is now, not as an earlier read left it in that cache.
+    posix_fadvise(dev.get(), 0, 0, POSIX_FADV_DONTNEED);
     int p[2];
     if (pipe2(p, O_CLOEXEC)) return -errno;
     unique_fd rd(p[0]), wr(p[1]);
@@ -396,13 +461,27 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
 
 /*
  * Waits for fsvmd to end and, when it ended on its own while its volume is still mounted (its VM broke and no new
- * one came up), has the volume unmounted and reported as not opened.
+ * one came up), has the volume unmounted and reported as not opened. Meanwhile passes on the end of the VM's check
+ * after the mount (W: writable now, F: it stays read-only), from fsvmd's pipe.
  */
-static void Watch(unique_fd conn, std::string volumeId, pid_t pid) {
-    std::thread([conn = std::move(conn), volumeId, pid]() {
+static void Watch(unique_fd conn, unique_fd ready, std::string volumeId, pid_t pid) {
+    std::thread([conn = std::move(conn), ready = std::move(ready), volumeId, pid]() {
         // The service closes the connection once fsvmd ended. Answers are left for Reap to read.
-        struct pollfd pfd = {conn.get(), 0, 0};
-        while (TEMP_FAILURE_RETRY(poll(&pfd, 1, -1)) != 1) {
+        struct pollfd pfd[2] = {{conn.get(), 0, 0}, {ready.get(), POLLIN, 0}};
+        for (;;) {
+            int n = TEMP_FAILURE_RETRY(poll(pfd, ready >= 0 ? 2 : 1, -1));
+            if (n <= 0) continue;
+            if (pfd[0].revents) break;
+            if (pfd[1].revents & POLLIN) {
+                char c = 0;
+                if (TEMP_FAILURE_RETRY(read(ready.get(), &c, 1)) == 1 && (c == 'W' || c == 'F')) {
+                    std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
+                    auto vol = VolumeManager::Instance()->findVolume(volumeId);
+                    if (vol) vol->onCheckDone(pid, c == 'W');
+                    continue;
+                }
+            }
+            if (pfd[1].revents) pfd[1].fd = -1;  // fsvmd closed it or wrote something else: only the end counts
         }
         std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
         auto vol = VolumeManager::Instance()->findVolume(volumeId);
@@ -464,14 +543,17 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
     struct pollfd pfd = {readyRead.get(), POLLIN, 0};
     char c = 0;
     if (TEMP_FAILURE_RETRY(poll(&pfd, 1, kReadyTimeoutMs)) == 1 &&
-        TEMP_FAILURE_RETRY(read(readyRead.get(), &c, 1)) == 1 && (c == 'R' || c == 'r')) {
-        // r: asked for writing, served read-only by the VM (fsvmd main.rs).
+        TEMP_FAILURE_RETRY(read(readyRead.get(), &c, 1)) == 1 && (c == 'R' || c == 'r' || c == 'c')) {
+        // r: asked for writing, served read-only by the VM. c: marked dirty, read-only while the VM checks it, then
+        // W or F on the same pipe (fsvmd main.rs).
         if (servedReadOnly) *servedReadOnly = c == 'r';
-        LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child;
+        LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child
+                  << (c == 'c' ? ", read-only while the VM checks it" : "");
         *pid = child;
         if (!v.obb) sServing++;
         if (conn >= 0) {
-            Watch(std::move(conn), v.volumeId, child);
+            if (c != 'c') readyRead.reset();
+            Watch(std::move(conn), std::move(readyRead), v.volumeId, child);
         } else {
             PLOG(WARNING) << "fsvm: fsvmd " << child << " is not watched";
         }
@@ -585,31 +667,6 @@ static bool ReadNumber(const std::string& path, uint64_t* out) {
     return ParseUint(android::base::Trim(s), out);
 }
 
-/* Finds partition `index` of the disk at `diskSysPath` with exactly `start` and `length`. */
-static bool FindPartition(const std::string& diskSysPath, const Part& p, dev_t* dev) {
-    std::unique_ptr<DIR, int (*)(DIR*)> dir(opendir(diskSysPath.c_str()), closedir);
-    if (!dir) return false;
-    while (struct dirent* e = readdir(dir.get())) {
-        if (e->d_name[0] == '.') continue;
-        std::string base = diskSysPath + "/" + e->d_name;
-        uint64_t index, start, size;
-        if (!ReadNumber(base + "/partition", &index) || index != p.index) continue;
-        if (!ReadNumber(base + "/start", &start) || !ReadNumber(base + "/size", &size) || start != p.start ||
-            size != p.length) {
-            return false;
-        }
-        std::string d;
-        unsigned maj, min;
-        if (!android::base::ReadFileToString(base + "/dev", &d) ||
-            sscanf(android::base::Trim(d).c_str(), "%u:%u", &maj, &min) != 2) {
-            return false;
-        }
-        *dev = makedev(maj, min);
-        return true;
-    }
-    return false;
-}
-
 static status_t Blkpg(const std::string& diskPath, int op, const Part& p) {
     unique_fd fd(TEMP_FAILURE_RETRY(open(diskPath.c_str(), O_RDONLY | O_CLOEXEC)));
     if (fd < 0) return -errno;
@@ -624,26 +681,68 @@ static status_t Blkpg(const std::string& diskPath, int op, const Part& p) {
     return ioctl(fd.get(), BLKPG, &a) ? -errno : OK;
 }
 
-status_t AddPartition(const std::string& diskPath, const std::string& diskSysPath, const Part& p, dev_t* dev,
-                      bool* added) {
-    *added = false;
-    if (p.index == 0 || p.index > kMaxIndex || p.length == 0 ||
-        p.start > UINT64_MAX / 512 - p.length) {
+static std::string RangePrefix(dev_t disk) {
+    return StringPrintf("fsvm-%u-%u-", major(disk), minor(disk));
+}
+
+std::string RangeName(dev_t disk, uint32_t index) {
+    return RangePrefix(disk) + std::to_string(index);
+}
+
+status_t CreateRange(const std::string& name, dev_t disk, uint64_t start, uint64_t length, bool readOnly,
+                     std::string* node, dev_t* dev) {
+    node->clear();
+    if (length == 0 || start > UINT64_MAX / 512 - length) return -EINVAL;
+    auto& dm = android::dm::DeviceMapper::Instance();
+    // A range left from before (vold restarted while it existed) goes first.
+    DeleteRange(name, "/dev/block/vold/" + name);
+    android::dm::DmTable table;
+    // By device number: the kernel opens the disk itself, no path is looked up.
+    if (!table.Emplace<android::dm::DmTargetLinear>(0, length, StringPrintf("%u:%u", major(disk), minor(disk)),
+                                                     start)) {
         return -EINVAL;
     }
-    status_t res = Blkpg(diskPath, BLKPG_ADD_PARTITION, p);
-    if (res != OK) {
-        LOG(ERROR) << "fsvm: adding partition " << p.index << " of " << diskPath << ": " << strerror(-res);
-        return res;
+    table.set_readonly(readOnly);
+    std::string path;
+    if (!dm.CreateDevice(name, table, &path, std::chrono::seconds(5))) {
+        PLOG(ERROR) << "fsvm: creating the range " << name;
+        return -EIO;
     }
-    *added = true;
-    if (!FindPartition(diskSysPath, p, dev)) {
-        LOG(ERROR) << "fsvm: partition " << p.index << " of " << diskPath << " not found after adding it";
-        DeletePartition(diskPath, p.index);
-        *added = false;
-        return -ENOENT;
+    struct stat st;
+    if (stat(path.c_str(), &st) || !S_ISBLK(st.st_mode)) {
+        PLOG(ERROR) << "fsvm: the range " << name << " has no device";
+        DeleteDmDeviceWaiting(name, true);
+        return -EIO;
     }
+    // vold's own node for it, labelled vold_device like the disk's: only fsvmd's VM manager and crosvm may use it,
+    // through the descriptor vold opens.
+    std::string n = "/dev/block/vold/" + name;
+    if (CreateDeviceNode(n, st.st_rdev) != OK) {
+        DeleteDmDeviceWaiting(name, true);
+        return -EIO;
+    }
+    *node = n;
+    if (dev) *dev = st.st_rdev;
+    LOG(INFO) << "fsvm: range " << name << " is sectors " << start << " to " << start + length << " of "
+              << major(disk) << ":" << minor(disk) << (readOnly ? ", read-only" : "");
     return OK;
+}
+
+status_t DeleteRange(const std::string& name, const std::string& node) {
+    if (!node.empty()) DestroyDeviceNode(node);
+    // A VM that just stopped may hold it for a moment: DeleteDmDeviceWaiting retries for 10 s.
+    return DeleteDmDeviceWaiting(name, true) ? OK : -EBUSY;
+}
+
+void DeleteRangesOf(dev_t disk) {
+    std::vector<android::dm::DeviceMapper::DmBlockDevice> devices;
+    if (!android::dm::DeviceMapper::Instance().GetAvailableDevices(&devices)) return;
+    const std::string prefix = RangePrefix(disk);
+    for (const auto& d : devices) {
+        if (!android::base::StartsWith(d.name(), prefix)) continue;
+        LOG(WARNING) << "fsvm: removing the range " << d.name() << " left from before";
+        DeleteRange(d.name(), "/dev/block/vold/" + d.name());
+    }
 }
 
 status_t DeleteAllPartitions(const std::string& diskPath, const std::string& diskSysPath) {

@@ -237,7 +237,7 @@ void Disk::destroyAllVolumes() {
     }
     mVolumes.clear();
 #ifdef VOLD_PUBLIC_FS_IN_VM
-    removeAddedPartitions();
+    removeRanges();
 #endif
 }
 

@@ -58,6 +58,12 @@ void VolumeBase::setState(State state) {
     }
 }
 
+void VolumeBase::announceReadOnly(bool readOnly) {
+    if (mState != State::kMounted || mReportReadOnly == readOnly) return;
+    mReportReadOnly = readOnly;
+    setState(State::kMounted);
+}
+
 status_t VolumeBase::setDiskId(const std::string& diskId) {
     if (mCreated) {
         LOG(WARNING) << getId() << " diskId change requires destroyed";
