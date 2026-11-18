@@ -43,6 +43,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <algorithm>
 #include <vector>
 
 using android::base::ReadFileToString;
@@ -401,15 +402,22 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
         if (++mProbeFailures <= 2) ScheduleReprobe(getId(), mProbeFailures == 1 ? 15 : 60, false);
     } else {
         mProbeFailures = 0;
+        // A mixed card (adoptable storage next to a public partition): each public partition is served through a
+        // partition device of its own, so its VM never gets the adoptable storage.
+        bool mixed = std::any_of(layout.parts.begin(), layout.parts.end(),
+                                 [](const fsvm::Part& p) { return p.cls != fsvm::Part::Class::kPublic; });
         for (const auto& part : layout.parts) {
             switch (part.cls) {
-                case fsvm::Part::Class::kPublic:
+                case fsvm::Part::Class::kPublic: {
                     if (part.index > static_cast<uint32_t>(maxMinors)) {
                         LOG(WARNING) << mId << ": partition " << part.index << " is beyond " << maxMinors;
                         break;
                     }
-                    createPublicVolumeInVm(part);
+                    fsvm::Part pub = part;
+                    pub.ownRange = mixed;
+                    createPublicVolumeInVm(pub);
                     break;
+                }
                 case fsvm::Part::Class::kExpand:
                     // This phone's adoptable storage that could not be added must not look unsupported (and
                     // offered for formatting): it shows as a card that could not be opened.

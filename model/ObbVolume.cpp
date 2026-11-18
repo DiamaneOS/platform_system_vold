@@ -18,13 +18,16 @@
 #include "Loop.h"
 #include "Utils.h"
 #include "VoldUtil.h"
+#include "VolumeManager.h"
 #include "fs/Fsvm.h"
 #include "fs/Vfat.h"
 
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 #include <cutils/fs.h>
+#include <cutils/multiuser.h>
 #include <private/android_filesystem_config.h>
+#include <utils/Timers.h>
 
 #include <android-base/strings.h>
 #include <map>
@@ -56,36 +59,72 @@ ObbVolume::~ObbVolume() {}
 #ifdef VOLD_PUBLIC_FS_IN_VM
 // DiamaneOS: an OBB is a FAT image an app wrote. Android's kernel never reads it: no loop device (a loop device alone
 // gets its partition table read when loop.max_part is set), no FAT mount. fsvmd serves it from the filesystem VM,
-// read-only. Each mounted OBB holds a VM, so at most a few at a time.
+// read-only. Each mounted OBB holds a VM, so at most a few at a time: in all, per user and per app, and an app
+// that just unmounted one waits a moment before the next (a mount is a VM start under vold's lock).
 static int sObbVms = 0;
 static constexpr int kMaxObbVms = 4;
-/* One app cannot take every slot from the others. */
 static std::map<gid_t, int> sObbVmsByOwner;
 static constexpr int kMaxObbVmsPerOwner = 2;
+static std::map<userid_t, int> sObbVmsByUser;
+static constexpr int kMaxObbVmsPerUser = 3;
+static std::map<gid_t, int64_t> sObbLastUnmountMs;
+static constexpr int64_t kObbCooldownMs = 1000;
 static constexpr uint64_t kMaxObbBytes = 8ULL << 30;
 
-/* Opens an OBB in /data/media/<user>/Android/obb/, read-only, refusing symlinks and anything outside. */
-static int OpenObb(const std::string& path) {
-    static constexpr char kRoot[] = "/data/media/";
-    if (!android::base::StartsWith(path, kRoot)) return -EINVAL;
-    // Exactly <user>/Android/obb/<package>/<file>: no other folder, no "." or ".." component, nothing empty.
-    auto parts = android::base::Split(path.substr(sizeof(kRoot) - 1), "/");
-    if (parts.size() != 5 || parts[0].empty() || parts[0].size() > 6 ||
-        parts[0].find_first_not_of("0123456789") != std::string::npos || parts[1] != "Android" ||
-        parts[2] != "obb") {
+static int64_t BootMs() {
+    return systemTime(SYSTEM_TIME_BOOTTIME) / 1000000;
+}
+
+/* "Android" and "obb" as the server's check takes them: in any case. */
+static bool IsObbDir(const std::vector<std::string>& p, size_t at) {
+    return strcasecmp(p[at].c_str(), "Android") == 0 && strcasecmp(p[at + 1].c_str(), "obb") == 0;
+}
+
+/*
+ * Opens an OBB read-only, refusing symlinks, magic links, other filesystems and anything outside its root, and not
+ * blocking (a FIFO in its place must not hold vold, which holds its lock). Two places, each exactly
+ * <root>/<...>/Android/obb/<package>/<file>, no "." or ".." component, nothing empty:
+ *
+ * - /data/media/<user>/Android/obb/..., internal shared storage, for the owner's user
+ * - /mnt/media_rw/<uuid>/Android/obb/..., an SD card or USB drive vold serves through the filesystem VM, mounted for
+ *   the owner's user. The file is read through that volume's FUSE mount, so through its own VM.
+ */
+static int OpenObb(const std::string& path, userid_t ownerUser) {
+    static constexpr char kData[] = "/data/media/";
+    static constexpr char kCard[] = "/mnt/media_rw/";
+    std::string root;
+    std::vector<std::string> parts;
+    if (android::base::StartsWith(path, kData)) {
+        parts = android::base::Split(path.substr(sizeof(kData) - 1), "/");
+        if (parts.size() != 5 || parts[0] != std::to_string(ownerUser) || !IsObbDir(parts, 1)) return -EINVAL;
+        root = "/data/media";
+    } else if (android::base::StartsWith(path, kCard)) {
+        parts = android::base::Split(path.substr(sizeof(kCard) - 1), "/");
+        if (parts.size() != 5 || parts[0].empty() || parts[0].size() > 64 || !IsObbDir(parts, 1)) return -EINVAL;
+        root = kCard + parts[0];
+        auto vol = VolumeManager::Instance()->findVolumeWithFilter([&](const VolumeBase& v) {
+            return v.getType() == VolumeBase::Type::kPublic && v.getState() == VolumeBase::State::kMounted &&
+                   v.getInternalPath() == root && v.getMountUserId() == ownerUser;
+        });
+        if (!vol) return -EINVAL;
+        // Below the volume's root: the component before Android/obb is the root itself.
+        parts[0] = ".";
+    } else {
         return -EINVAL;
     }
-    for (size_t i = 3; i < parts.size(); i++) {
-        if (parts[i].empty() || parts[i] == "." || parts[i] == ".." || parts[i].size() > 255) return -EINVAL;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (parts[i].empty() || parts[i] == ".." || parts[i].size() > 255) return -EINVAL;
+        if (parts[i] == "." && (i != 0 || root == "/data/media")) return -EINVAL;
     }
-    android::base::unique_fd root(TEMP_FAILURE_RETRY(open("/data/media", O_PATH | O_DIRECTORY | O_CLOEXEC)));
-    if (root < 0) return -errno;
+    std::string rel = android::base::Join(
+            std::vector<std::string>(parts.begin() + (parts[0] == "." ? 1 : 0), parts.end()), "/");
+    android::base::unique_fd dir(TEMP_FAILURE_RETRY(open(root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC)));
+    if (dir < 0) return -errno;
     struct open_how how = {};
-    // Not blocking: a FIFO in place of the file must not hold vold, which holds its lock.
     how.flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY | O_NONBLOCK;
     how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV;
-    int fd = TEMP_FAILURE_RETRY(static_cast<int>(
-            syscall(__NR_openat2, root.get(), path.c_str() + sizeof(kRoot) - 1, &how, sizeof(how))));
+    int fd = TEMP_FAILURE_RETRY(
+            static_cast<int>(syscall(__NR_openat2, dir.get(), rel.c_str(), &how, sizeof(how))));
     return fd < 0 ? -errno : fd;
 }
 #endif
@@ -124,15 +163,22 @@ status_t ObbVolume::doDestroy() {
 status_t ObbVolume::doMount() {
 #ifdef VOLD_PUBLIC_FS_IN_VM
     if (mFsvmdPid > 0) return -EBUSY;
-    if (sObbVms >= kMaxObbVms || sObbVmsByOwner[mOwnerGid] >= kMaxObbVmsPerOwner) {
+    const userid_t user = multiuser_get_user_id(mOwnerGid);
+    if (sObbVms >= kMaxObbVms || sObbVmsByOwner[mOwnerGid] >= kMaxObbVmsPerOwner ||
+        sObbVmsByUser[user] >= kMaxObbVmsPerUser) {
         LOG(ERROR) << getId() << " not mounted: too many OBB images are mounted already";
         return -EBUSY;
     }
-    android::base::unique_fd fd(OpenObb(mSourcePath));
+    auto last = sObbLastUnmountMs.find(mOwnerGid);
+    if (last != sObbLastUnmountMs.end() && BootMs() - last->second < kObbCooldownMs) {
+        LOG(ERROR) << getId() << " not mounted: the same app unmounted one a moment ago";
+        return -EBUSY;
+    }
+    android::base::unique_fd fd(OpenObb(mSourcePath, user));
     struct stat st;
     if (fd < 0 || fstat(fd.get(), &st) || !S_ISREG(st.st_mode) || st.st_size < 512 ||
         static_cast<uint64_t>(st.st_size) > kMaxObbBytes) {
-        LOG(ERROR) << getId() << " not mounted: not an OBB file below /data/media";
+        LOG(ERROR) << getId() << " not mounted: not an OBB file of this user's shared storage or card";
         return -EINVAL;
     }
     auto obbPath = StringPrintf("/mnt/obb/%s", getId().c_str());
@@ -156,6 +202,7 @@ status_t ObbVolume::doMount() {
     }
     sObbVms++;
     sObbVmsByOwner[mOwnerGid]++;
+    sObbVmsByUser[user]++;
     return OK;
 #endif
     auto path = StringPrintf("/mnt/obb/%s", getId().c_str());
@@ -182,10 +229,13 @@ status_t ObbVolume::doUnmount() {
     ForceUnmount(path);
 #ifdef VOLD_PUBLIC_FS_IN_VM
     if (mFsvmdPid > 0) {
-        fsvm::Stop(mFsvmdPid);
+        fsvm::Stop(mFsvmdPid, true);
         mFsvmdPid = -1;
         sObbVms--;
         if (--sObbVmsByOwner[mOwnerGid] <= 0) sObbVmsByOwner.erase(mOwnerGid);
+        const userid_t user = multiuser_get_user_id(mOwnerGid);
+        if (--sObbVmsByUser[user] <= 0) sObbVmsByUser.erase(user);
+        sObbLastUnmountMs[mOwnerGid] = BootMs();
     }
 #endif
     rmdir(path.c_str());

@@ -34,6 +34,9 @@ class ObbVolume : public VolumeBase {
 
     void onFsvmdExit(pid_t pid) override;
 
+    /* The OBB file vold opens (below /data/media, or below a public volume's /mnt/media_rw/<uuid>) */
+    const std::string& getSourcePath() const { return mSourcePath; }
+
   protected:
     status_t doCreate() override;
     status_t doDestroy() override;

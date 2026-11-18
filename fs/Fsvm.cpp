@@ -63,14 +63,23 @@ namespace fsvm {
 
 static constexpr char kService[] = "/dev/socket/fsvmd";
 /*
- * vold holds its lock while it waits, and system_server's watchdog asks for that lock (60 s). fsvmd keeps to 20 s
- * for a probe and 30 s for a mount (fsvmd PROBE_BUDGET and SERVE_BUDGET: VM starts, the check, the mount and the
- * first free-space count), vold waits a little longer, a stop takes at most 2 s, and the steps after the VM mount
- * get 15 s (Guard). So a mount holds the lock for at most 50 s, a probe for 25 s.
+ * vold holds its lock while it waits, and system_server's watchdog asks for that lock (60 s). Every wait is bounded:
+ *
+ * - probe: fsvmd keeps to 20 s (PROBE_BUDGET), vold reads for at most 23 s, then Reap takes at most 4 s in all.
+ *   At most 27 s.
+ * - mount: fsvmd keeps to 30 s (SERVE_BUDGET: VM starts, the check, the mount, the first free-space count), vold
+ *   waits 33 s. The steps after it (MediaProvider's FUSE, bind mounts) end at the deadline PublicVolume's Guard
+ *   sets: 48 s after the mount began, at least 8 s. A failed mount adds a stop of at most 3 s. At most 51 s.
+ * - unmount: the steps before the stop get 15 s (a Guard ends fsvmd when FUSE requests hang), the orderly stop at
+ *   most kSyncMs plus 3 s. At most 30 s.
  */
 static constexpr int kProbeTimeoutMs = 23000;
 static constexpr int kReadyTimeoutMs = 33000;
-static constexpr int kStopMs = 2000;
+/* After vold unmounted FUSE, fsvmd writes back and unmounts in the VM (fsvmd CLOSE_LOCK_WAIT plus CLOSE_BUDGET). */
+static constexpr int kSyncMs = 12000;
+/* After a stop request, then after a kill. */
+static constexpr int kTermMs = 2000;
+static constexpr int kKillMs = 1000;
 /* The service answers a request at once: it only forks. */
 static constexpr int kStartMs = 3000;
 /* Serving VMs at a time, OBB images excluded (ObbVolume has its own caps). */
@@ -110,7 +119,8 @@ static bool ReadAnswer(int fd, int ms, char* kind, uint64_t* value) {
 
 /* Has the service run fsvmd with exactly the descriptors given as 3, 4 and 5 (-1: none). Returns its pid, or -1. */
 static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
-    unique_fd s(socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+    // Not blocking: a service that is not accepting (stopped, restarting) refuses at once instead of holding vold.
+    unique_fd s(socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (s < 0) return -1;
     struct sockaddr_un addr = {};
     addr.sun_family = AF_UNIX;
@@ -183,8 +193,12 @@ static void Tell(int conn, char c) {
     TEMP_FAILURE_RETRY(send(conn, &c, 1, MSG_NOSIGNAL));
 }
 
-/* Waits for fsvmd `pid` to exit within `ms`, else has it killed. Returns its exit status, or -1 when killed. */
-static int Reap(pid_t pid, int ms) {
+/*
+ * Waits for fsvmd `pid` to exit within `waitMs`. Then, when `termMs` is not 0, asks it to stop and waits that long,
+ * and last kills it and waits kKillMs. Returns its exit status, or -1 when it had to be killed. At most waitMs plus
+ * termMs plus kKillMs in all.
+ */
+static int Reap(pid_t pid, int waitMs, int termMs) {
     unique_fd conn;
     {
         std::lock_guard<std::mutex> lock(sChildrenLock);
@@ -195,10 +209,14 @@ static int Reap(pid_t pid, int ms) {
     }
     char kind = 0;
     uint64_t value = 0;
-    if (ReadAnswer(conn.get(), ms, &kind, &value) && kind == 'X') return static_cast<int>(value);
+    if (ReadAnswer(conn.get(), waitMs, &kind, &value) && kind == 'X') return static_cast<int>(value);
+    if (termMs > 0) {
+        Tell(conn.get(), 'T');
+        if (ReadAnswer(conn.get(), termMs, &kind, &value) && kind == 'X') return static_cast<int>(value);
+    }
     Tell(conn.get(), 'K');
     // The service reaps it at once, and closing the connection kills it in any case.
-    ReadAnswer(conn.get(), kStopMs, &kind, &value);
+    ReadAnswer(conn.get(), kKillMs, &kind, &value);
     return -1;
 }
 
@@ -245,9 +263,19 @@ static bool DecodeLabel(const std::string& hex, std::string* out) {
     return true;
 }
 
-status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out) {
+uint32_t BlockSize(int fd) {
+    int ss = 0;
+    if (ioctl(fd, BLKSSZGET, &ss) || (ss != 512 && ss != 4096)) return 0;
+    return static_cast<uint32_t>(ss);
+}
+
+status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out, uint32_t blockSize) {
     *out = Layout();
     if (text.size() > kMaxProbeOutput || diskBytes % 512 || text.empty() || text.back() != '\n') return -EINVAL;
+    if (blockSize != 512 && blockSize != 4096) return -EINVAL;
+    // The sectors a GPT with 128 entries takes at the start (MBR, header, entries) and at the end (entries, header).
+    const uint64_t entryBlocks = (128 * 128 + blockSize - 1) / blockSize;
+    const uint64_t gptHead = (2 + entryBlocks) * (blockSize / 512), gptTail = (1 + entryBlocks) * (blockSize / 512);
     std::vector<std::string> lines = Split(text.substr(0, text.size() - 1), "\n");
     if (lines.size() < 2) return -EINVAL;
     std::vector<std::string> head = Split(lines[0], " ");
@@ -280,10 +308,12 @@ status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out) {
         else if (f[7] != "-") return -EINVAL;
         if (!DecodeLabel(f[9], &p.label)) return -EINVAL;
         if ((head[2] == "none") != (p.index == 0)) return -EINVAL;
-        if (head[2] == "mbr" && p.index > 4) return -EINVAL;
+        // 4 primary partitions and up to 32 logical ones, numbered from 5 as Linux numbers them.
+        if (head[2] == "mbr" && p.index > 36) return -EINVAL;
         if (head[2] != "gpt" && (p.cls != Part::Class::kPublic || !p.partGuid.empty())) return -EINVAL;
         if (head[2] == "gpt" &&
-            (p.partGuid.empty() || sectors < 67 || p.start < 34 || p.start + p.length > sectors - 33)) {
+            (p.partGuid.empty() || sectors < gptHead + gptTail || p.start < gptHead ||
+             p.start + p.length > sectors - gptTail)) {
             return -EINVAL;
         }
         if (p.cls != Part::Class::kPublic && !p.fsType.empty()) return -EINVAL;
@@ -319,10 +349,17 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out) {
         PLOG(ERROR) << "fsvm: opening " << diskPath;
         return -errno;
     }
+    uint32_t blockSize = BlockSize(dev.get());
+    if (!blockSize) {
+        LOG(ERROR) << "fsvm: " << diskPath << " has a logical block size the VM does not take";
+        return -EINVAL;
+    }
     int p[2];
     if (pipe2(p, O_CLOEXEC)) return -errno;
     unique_fd rd(p[0]), wr(p[1]);
-    pid_t child = Spawn({"--probe", "--disk-bytes", std::to_string(diskBytes)}, dev.get(), -1, wr.get());
+    pid_t child = Spawn({"--probe", "--disk-bytes", std::to_string(diskBytes), "--block-size",
+                         std::to_string(blockSize)},
+                        dev.get(), -1, wr.get());
     if (child < 0) {
         LOG(ERROR) << "fsvm: fsvmd did not start for " << diskPath;
         return -EIO;
@@ -331,12 +368,12 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out) {
     dev.reset();
     std::string text;
     status_t res = ReadAll(rd.get(), NowMs() + kProbeTimeoutMs, kMaxProbeOutput, &text);
-    int rc = Reap(child, res == OK ? 5000 : 0);
+    int rc = Reap(child, res == OK ? 3000 : 0, 0);
     if (res != OK || rc != 0) {
         LOG(ERROR) << "fsvm: the filesystem VM did not read " << diskPath << " (" << res << ", exit " << rc << ")";
         return res != OK ? res : -EIO;
     }
-    res = ParseLayout(text, diskBytes, out);
+    res = ParseLayout(text, diskBytes, out, blockSize);
     if (res != OK) {
         LOG(ERROR) << "fsvm: refusing the layout of " << diskPath;
         return res;
@@ -391,9 +428,10 @@ status_t Mount(Volume&& v, pid_t* pid) {
     std::vector<std::string> args;
     if (v.obb) {
         args = {"--obb", "--volume", v.volumeId, "--gid", std::to_string(v.gid), "--disk-bytes",
-                std::to_string(v.diskBytes)};
+                std::to_string(v.diskBytes), "--block-size", "512"};
     } else {
         args = {"--volume", v.volumeId, "--gid", std::to_string(v.gid), "--disk-bytes", std::to_string(v.diskBytes),
+                "--block-size", std::to_string(v.blockSize),
                 "--partition", std::to_string(v.part.index), "--start", std::to_string(v.part.start),
                 "--length", std::to_string(v.part.length), "--fs", v.part.fsType.empty() ? "-" : v.part.fsType,
                 "--meta-bytes", std::to_string(v.part.metaBytes)};
@@ -426,16 +464,20 @@ status_t Mount(Volume&& v, pid_t* pid) {
         return OK;
     }
     LOG(ERROR) << "fsvm: the filesystem VM did not serve " << v.volumeId << ", not mounting it";
-    Stop(child);
+    Stop(child, false);
     umount2(v.target.c_str(), MNT_DETACH);
     return -EIO;
 }
 
-void Stop(pid_t pid) {
+void Stop(pid_t pid, bool orderly) {
     if (pid <= 0) return;
-    unique_fd conn = Connection(pid);
-    if (conn >= 0) Tell(conn.get(), 'T');
-    if (Reap(pid, kStopMs) < 0) LOG(WARNING) << "fsvm: fsvmd " << pid << " killed";
+    int64_t t0 = NowMs();
+    int rc = Reap(pid, orderly ? kSyncMs : 0, kTermMs);
+    if (rc < 0) {
+        LOG(WARNING) << "fsvm: fsvmd " << pid << " killed after " << NowMs() - t0 << " ms";
+    } else {
+        LOG(INFO) << "fsvm: fsvmd " << pid << " ended (" << rc << ") after " << NowMs() - t0 << " ms";
+    }
 }
 
 void Served(bool obb, bool starting) {
@@ -461,9 +503,13 @@ Guard::Guard(pid_t pid, int ms) : mState(std::make_shared<State>()) {
         std::unique_lock<std::mutex> l(state->lock);
         if (!state->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return state->done; }) &&
             state->conn >= 0) {
-            LOG(ERROR) << "fsvm: the mount steps after the VM took too long, stopping fsvmd " << pid;
-            // Ends its FUSE connection, so the steps waiting on it fail at once.
-            Tell(state->conn.get(), 'K');
+            LOG(ERROR) << "fsvm: the steps around the VM took too long, stopping fsvmd " << pid;
+            // Ends its FUSE connection, so the steps waiting on it fail at once. A stop first, so that fsvmd writes
+            // the volume back if it is not stuck itself, then a kill.
+            Tell(state->conn.get(), 'T');
+            if (!state->cv.wait_for(l, std::chrono::milliseconds(kTermMs), [&] { return state->done; })) {
+                Tell(state->conn.get(), 'K');
+            }
         }
     }).detach();
 }

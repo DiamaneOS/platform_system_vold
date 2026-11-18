@@ -81,6 +81,26 @@ TEST(FsvmTest, RefusesAnythingElse) {
     EXPECT_NE(OK, ParseLayout("LAYOUT 1 none 0\nEND\n", kDisk + 1, &l));
 }
 
+TEST(FsvmTest, LogicalPartitionsAndBlockSizes) {
+    Layout l;
+    // Logical partitions of an extended MBR partition are numbered from 5, up to 36.
+    EXPECT_EQ(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 5 public 4160 2048 vfat - - 0 -\nEND\n", kDisk, &l));
+    EXPECT_NE(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 37 public 4160 2048 vfat - - 0 -\nEND\n", kDisk, &l));
+    // A GPT takes 48 sectors at the start and 40 at the end on a disk with 4096-byte blocks, 34 and 33 with 512.
+    const std::string sectors = std::to_string(kDisk / 512);
+    const char* guid = "01010101-0101-0101-0101-010101010101";
+    auto gpt = [&](uint64_t start, uint64_t length) {
+        return "LAYOUT 1 gpt 1\nPART 1 public " + std::to_string(start) + " " + std::to_string(length) +
+               " vfat - " + guid + " 0 -\nEND\n";
+    };
+    EXPECT_EQ(OK, ParseLayout(gpt(34, 100), kDisk, &l, 512));
+    EXPECT_NE(OK, ParseLayout(gpt(34, 100), kDisk, &l, 4096));
+    EXPECT_EQ(OK, ParseLayout(gpt(48, 100), kDisk, &l, 4096));
+    EXPECT_EQ(OK, ParseLayout(gpt(kDisk / 512 - 133, 100), kDisk, &l, 512));
+    EXPECT_NE(OK, ParseLayout(gpt(kDisk / 512 - 133, 100), kDisk, &l, 4096));
+    EXPECT_NE(OK, ParseLayout(gpt(48, 100), kDisk, &l, 1024));
+}
+
 }  // namespace fsvm
 }  // namespace vold
 }  // namespace android

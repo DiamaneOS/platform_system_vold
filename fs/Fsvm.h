@@ -49,6 +49,11 @@ struct Part {
     std::string partGuid; /* GPT unique partition GUID as sgdisk printed it, or empty */
     std::string label;
     uint64_t metaBytes = 0; /* metadata the filesystem keeps in memory, sizes the VM */
+    /*
+     * The disk also holds adoptable storage (a mixed card): this public partition is served through a partition
+     * device of its own, so the VM gets only its range and never the adoptable storage next to it.
+     */
+    bool ownRange = false;
 };
 
 struct Layout {
@@ -59,14 +64,21 @@ struct Layout {
 /* Has the filesystem VM read the partition table of the disk at `diskPath`. */
 status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out);
 
-/* Parses and checks fsvmd's probe output (exposed for vold_tests). */
-status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out);
+/*
+ * Parses and checks fsvmd's probe output (exposed for vold_tests). `blockSize`: the disk's logical block size, which
+ * sets how much room a GPT takes at either end (34 and 33 sectors for 512-byte blocks, 48 and 40 for 4096).
+ */
+status_t ParseLayout(const std::string& text, uint64_t diskBytes, Layout* out, uint32_t blockSize = 512);
+
+/* The logical block size of a block device (512 or 4096), or 0. */
+uint32_t BlockSize(int fd);
 
 struct Volume {
     android::base::unique_fd fd; /* the whole disk, or the OBB file */
     bool obb = false;
     bool readOnly = false;
     uint64_t diskBytes = 0;
+    uint32_t blockSize = 512;
     Part part; /* unused for an OBB */
     gid_t gid = 0;
     std::string volumeId;
@@ -79,15 +91,20 @@ struct Volume {
  */
 status_t Mount(Volume&& v, pid_t* pid);
 
-/* Stops fsvmd after its FUSE mount is gone. */
-void Stop(pid_t pid);
+/*
+ * Stops fsvmd. `orderly`: its FUSE mount is gone, and fsvmd writes the volume back and unmounts it in the VM before
+ * it ends (up to kSyncMs). Otherwise (a mount that failed, nothing written) it is stopped at once. Either way it is
+ * gone after kSyncMs plus 3 s at most.
+ */
+void Stop(pid_t pid, bool orderly);
 
 /* Counts a serving fsvmd that ended (Mount counts the ones that start). */
 void Served(bool obb, bool starting);
 
 /*
- * Kills fsvmd `pid` unless it is cancelled within `ms`: the steps of a mount after the VM served the volume go through
- * fsvmd, and vold holds its lock until they end.
+ * Stops fsvmd `pid` (a stop, then a kill 2 s later) unless it is cancelled within `ms`: the steps of a mount after the
+ * VM served the volume, and of an unmount before fsvmd stops, go through fsvmd, and vold holds its lock until they
+ * end.
  */
 class Guard {
   public:

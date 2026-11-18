@@ -25,6 +25,7 @@
 
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <cutils/fs.h>
 #include <private/android_filesystem_config.h>
@@ -32,6 +33,9 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+
+#include <algorithm>
+#include <optional>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -169,7 +173,8 @@ void PublicVolume::removeTempPartition() {
 }
 
 status_t PublicVolume::checkInVm() {
-    // The filesystem check runs in the VM, as part of fsvmd's mount, with the same tools vold ran here before.
+    // The filesystem check runs in the VM, as part of fsvmd's mount, with the fsck_msdos and fsck.exfat vold ran
+    // here before. Not with the same arguments: the VM checks a volume only when it is marked dirty.
     if (mPart.unread) {
         LOG(ERROR) << getId() << ": the filesystem VM could not read this disk";
         mVmFailed = true;
@@ -192,7 +197,16 @@ void PublicVolume::onFsvmdExit(pid_t pid) {
 
 status_t PublicVolume::mountInVm(gid_t gid) {
     fsvm::Volume v;
-    const std::string& path = mInVm ? mDiskDevPath : mDevPath;
+    std::string path = mInVm ? mDiskDevPath : mDevPath;
+    // A mixed card: the VM gets this partition only, never the adoptable storage next to it.
+    bool ownRange = mInVm && mPart.ownRange && mPart.index > 0;
+    if (ownRange) {
+        status_t res = addTempPartition(&path);
+        if (res != OK) {
+            LOG(ERROR) << getId() << ": no partition device of its own on this mixed card (" << res << ")";
+            return res;
+        }
+    }
     v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDWR | O_CLOEXEC)));
     if (v.fd < 0 && (errno == EROFS || errno == EACCES)) {
         // A card with its write-protect switch on, as the kernel mount handled it: served read-only.
@@ -200,10 +214,23 @@ status_t PublicVolume::mountInVm(gid_t gid) {
         v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
     }
     if (v.fd < 0) {
+        int e = errno;
         PLOG(ERROR) << getId() << ": opening " << path;
-        return -errno;
+        if (ownRange) removeTempPartition();
+        return -e;
     }
-    if (mInVm) {
+    v.blockSize = fsvm::BlockSize(v.fd.get());
+    if (!v.blockSize) {
+        if (ownRange) removeTempPartition();
+        return -EINVAL;
+    }
+    if (ownRange) {
+        // The partition alone, as a disk of its own: the filesystem starts at its first sector.
+        v.diskBytes = mPart.length * 512;
+        v.part = mPart;
+        v.part.index = 0;
+        v.part.start = 0;
+    } else if (mInVm) {
         v.part = mPart;
         v.diskBytes = mDiskBytes;
     } else {
@@ -218,7 +245,19 @@ status_t PublicVolume::mountInVm(gid_t gid) {
     v.gid = gid;
     v.volumeId = getId();
     v.target = mRawPath;
-    return fsvm::Mount(std::move(v), &mFsvmdPid);
+    status_t res = fsvm::Mount(std::move(v), &mFsvmdPid);
+    if (res != OK && ownRange) removeTempPartition();
+    return res;
+}
+
+void PublicVolume::stopInVm() {
+    if (mFsvmdPid > 0) {
+        // Its FUSE mount is gone: fsvmd writes the volume back and unmounts it in the VM before it ends.
+        fsvm::Stop(mFsvmdPid, true);
+        fsvm::Served(false, false);
+    }
+    mFsvmdPid = -1;
+    if (mPart.ownRange) removeTempPartition();
 }
 
 status_t PublicVolume::formatInVm(const std::string& fsType) {
@@ -347,6 +386,7 @@ status_t PublicVolume::doMount() {
 #ifdef VOLD_PUBLIC_FS_IN_VM
     // DiamaneOS: Android's kernel never mounts a FAT or exFAT volume. fsvmd serves it from a protected VM. If the VM
     // does not serve it, the volume is not mounted: there is no fallback to the kernel mount.
+    mMountStartMs = systemTime(SYSTEM_TIME_BOOTTIME) / 1000000;
     if (mountInVm(isVisible ? AID_MEDIA_RW : AID_EXTERNAL_STORAGE) != OK) {
         LOG(ERROR) << getId() << " was not served by the filesystem VM";
         mVmFailed = true;
@@ -355,7 +395,10 @@ status_t PublicVolume::doMount() {
     }
     // Every later step reads through fsvmd. Any failure from here on is the VM path's, and must not offer a format.
     mVmFailed = true;
-    fsvm::Guard guard(mFsvmdPid, 15000);
+    // The steps after the VM served the volume (MediaProvider's FUSE, which may have to start first after boot) get
+    // whatever the VM left of 48 s, at least 15 s: a quick VM mount leaves them more. vold holds its lock throughout.
+    int64_t spent = systemTime(SYSTEM_TIME_BOOTTIME) / 1000000 - mMountStartMs;
+    fsvm::Guard guard(mFsvmdPid, static_cast<int>(std::max<int64_t>(15000, 48000 - spent)));
 #else
     if (mFsType == "vfat") {
         if (vfat::Mount(mDevPath, mRawPath, false, false, false, AID_ROOT,
@@ -518,6 +561,15 @@ status_t PublicVolume::bindMountForUser(userid_t user_id) {
 }
 
 status_t PublicVolume::doUnmount() {
+#ifdef VOLD_PUBLIC_FS_IN_VM
+    // DiamaneOS: fsvmd stops on every way out, also when unmounting FUSE fails below. A stuck fsvmd (its VM hangs,
+    // FUSE requests wait) is ended after 15 s, so the steps waiting on it fail at once.
+    auto stop = android::base::make_scope_guard([this] { stopInVm(); });
+    std::optional<fsvm::Guard> stuck;
+    if (mFsvmdPid > 0) stuck.emplace(mFsvmdPid, 15000);
+    // OBB images served from this card go first: their VMs read through this volume.
+    VolumeManager::Instance()->unmountObbsBelow(getInternalPath());
+#endif
     // Unmount the storage before we kill the FUSE process. If we kill
     // the FUSE process first, most file system operations will return
     // ENOTCONN until the unmount completes. This is an exotic and unusual
@@ -600,12 +652,10 @@ status_t PublicVolume::doUnmount() {
         PLOG(INFO) << "use umount lazy if force unmount fail";
     }
 #ifdef VOLD_PUBLIC_FS_IN_VM
-    // The FUSE mount is gone, so fsvmd and its VM can stop.
-    if (mFsvmdPid > 0) {
-        fsvm::Stop(mFsvmdPid);
-        fsvm::Served(false, false);
-    }
-    mFsvmdPid = -1;
+    // The FUSE mount is gone, so fsvmd and its VM can stop, after writing the volume back. The guard for the steps
+    // before must not cut that short.
+    stuck.reset();
+    stopInVm();
 #endif
     if(rmdir(mRawPath.c_str()) != 0) {
         PLOG(INFO) << "rmdir mRawPath=" << mRawPath << " fail";

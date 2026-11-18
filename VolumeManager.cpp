@@ -1228,6 +1228,17 @@ int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
     return android::OK;
 }
 
+void VolumeManager::unmountObbsBelow(const std::string& path) {
+    if (path.empty()) return;
+    for (const auto& vol : mObbVolumes) {
+        auto obb = std::static_pointer_cast<android::vold::ObbVolume>(vol);
+        if (StartsWith(obb->getSourcePath(), path + "/") && vol->getState() == VolumeBase::State::kMounted) {
+            LOG(INFO) << vol->getId() << ": unmounting, its volume " << path << " goes";
+            vol->unmount();
+        }
+    }
+}
+
 int VolumeManager::destroyObb(const std::string& volId) {
     auto i = mObbVolumes.begin();
     while (i != mObbVolumes.end()) {

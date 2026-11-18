@@ -95,6 +95,10 @@ class PublicVolume : public VolumeBase {
 
     /* fsvmd serving this volume from a protected VM, or -1 */
     pid_t mFsvmdPid = -1;
+    /* When the current mount began (fsvm, NowMs), for the deadline of the steps after the VM served it */
+    int64_t mMountStartMs = 0;
+    /* Stops fsvmd, frees its serving slot and removes a mixed card's partition, on every way out of an unmount */
+    void stopInVm();
 
     /* DiamaneOS phase 2: the partition the VM read, on the whole disk at mDiskDevPath */
     bool mInVm = false;

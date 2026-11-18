@@ -190,6 +190,8 @@ class VolumeManager {
 
     int createObb(const std::string& path, int32_t ownerGid, std::string* outVolId);
     int destroyObb(const std::string& volId);
+    /* DiamaneOS: unmounts the OBB images whose file is below `path` (a public volume that is about to go). */
+    void unmountObbsBelow(const std::string& path);
 
     int createStubVolume(const std::string& sourcePath, const std::string& mountPath,
                          const std::string& fsType, const std::string& fsUuid,
