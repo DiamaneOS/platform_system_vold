@@ -60,6 +60,15 @@ void Disk::prepareStopAll() {
     for (const auto& vol : mVolumes) vol->prepareStop();
 }
 
+void Disk::dropOldMedium() {
+    LOG(WARNING) << mId << ": the medium changed, the old one's volumes are cut off before they stop";
+    fsvm::FailRangesOf(mDevice);
+    for (const auto& vol : mVolumes) {
+        // A VM disk's public volumes are all PublicVolume (createPublicVolumeInVm).
+        if (vol->getType() == VolumeBase::Type::kPublic) static_cast<PublicVolume*>(vol.get())->dropMedium();
+    }
+}
+
 void Disk::removeRanges() {
     for (const auto& name : mRanges) {
         fsvm::DeleteRange(name, "/dev/block/vold/" + name);
@@ -107,7 +116,7 @@ bool Disk::createPrivateVolumeInVm(const fsvm::Part& part) {
     // ranges hold the card as device-mapper, which may share it).
     std::string name = fsvm::RangeName(mDevice, part.index), node;
     dev_t rangeDevice;
-    if (fsvm::CreateRange(name, mDevice, part.start, part.length, false, &node, &rangeDevice) != OK) {
+    if (fsvm::CreateRange(name, mDevice, part.start, part.length, false, &node, &rangeDevice, part.diskSeq) != OK) {
         LOG(ERROR) << mId << ": could not set up the adoptable storage range";
         return false;
     }
@@ -181,14 +190,18 @@ void Disk::reprobeInVm(Reprobe why) {
             if (!mProbeFailed) return;
             mForceProbe = true;
             readPartitions();
+            mForceProbe = false;
             return;
         case Reprobe::kConfirm:
-            // The second probe of an answer that would offer a format, unless the disk was read again since.
+            // The second probe of an answer that would offer a format, unless the disk was read again since. Both
+            // flags go after it, also when readPartitions returned before reading them (getMaxMinors).
             mConfirmScheduled = false;
             if (!mVerdictPending) return;
             mForceProbe = true;
             mConfirmProbe = true;
             readPartitions();
+            mForceProbe = false;
+            mConfirmProbe = false;
             return;
         case Reprobe::kFailedProbe:
         case Reprobe::kMountRetry:
@@ -209,6 +222,7 @@ void Disk::reprobeInVm(Reprobe why) {
               << (why == Reprobe::kMountRetry ? " to mount it again" : "");
     mForceProbe = why == Reprobe::kMountRetry;
     readPartitions();
+    mForceProbe = false;
 }
 
 void Disk::retryMountLater() {
@@ -245,6 +259,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
             // A new medium (a card changed in a USB reader): the volumes and partitions of the old one go now, not
             // at the probe that is put off. Android's kernel keeps its partitions across a media change.
             LOG(INFO) << mId << ": the medium changed, dropping the old one's volumes until it is read";
+            dropOldMedium();
             destroyAllVolumes();
             mPublicVolumes = 0;
             mVerdictPending = false;
@@ -257,6 +272,8 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
         }
         return OK;
     }
+    // Another medium than the one the volumes were made for: nothing of theirs may reach it (dropOldMedium).
+    const bool newMedium = mProbed && (seq != mProbedSeq || mSize != mProbedSize);
     mProbed = true;
     mProbedSeq = seq;
     mProbedSize = mSize;
@@ -272,10 +289,13 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
                    << "(CONFIG_BLK_NO_EXTERNAL_PART_SCAN is missing), not serving it";
     }
 
+    if (newMedium) dropOldMedium();
     destroyAllVolumes();
     mPublicVolumes = 0;
-    // Ranges left from before (vold restarted, the medium changed) go before the disk is read again.
+    // Ranges left from before (vold restarted, the medium changed) go before the disk is read again, and those of
+    // disks that are gone.
     fsvm::DeleteRangesOf(mDevice);
+    fsvm::SweepRanges();
 
     // No medium (an empty slot in a USB card reader): nothing to read, as when sgdisk failed before.
     if (mSize == static_cast<uint64_t>(-1) || mSize < 512) {
@@ -306,6 +326,11 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     fsvm::Layout layout;
     mProbeFailed = kernelScans || fsvm::DeleteAllPartitions(mDevPath, mSysPath) != OK ||
                    fsvm::Probe(mDevPath, mSize, &layout) != OK;
+    // Everything made from this answer is bound to the medium it was read from (sequence read before the probe: a
+    // medium changed during the probe fails the checks, never the other way round).
+    layout.diskSeq = android::base::Trim(seq);
+    layout.diskBytes = mSize;
+    for (auto& p : layout.parts) p.diskSeq = layout.diskSeq;
     if (mProbeFailed) {
         LOG(ERROR) << mId << ": the filesystem VM could not read the disk";
         mVerdictPending = false;

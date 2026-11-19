@@ -52,6 +52,8 @@ class PublicVolume : public VolumeBase {
     std::string getStableName();
 
     void prepareStop() override;
+    /* DiamaneOS: the disk's medium changed under the volume: its fsvmd goes now, without writing back */
+    void dropMedium();
 
   protected:
     status_t doCreate() override;
@@ -66,7 +68,7 @@ class PublicVolume : public VolumeBase {
     bool mountFailedInVm() const override { return mVmFailed; }
     bool writeBackFailed() const override { return mWriteBackFailed; }
     void onFsvmdExit(pid_t pid) override;
-    void onCheckDone(pid_t pid, bool writable) override;
+    void onCheckDone(pid_t pid, char state) override;
     void onMountFailed() override;
     void doPostMount() override;
     /* DiamaneOS: the steps of doMount around the filesystem VM (PublicVolumeFsvm.cpp) */

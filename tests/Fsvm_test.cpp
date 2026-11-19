@@ -150,6 +150,25 @@ TEST(FsvmTest, OnlyTwoEqualAnswersOfferAFormat) {
     Layout unread = ntfs;
     unread.parts[0].unread = true;
     EXPECT_FALSE(SameLayout(unread, unread));
+    // The same answer from another medium (a blank card swapped for another between the two probes) or size.
+    Layout first = blank, second = blank;
+    first.diskSeq = "41";
+    second.diskSeq = "42";
+    EXPECT_FALSE(SameLayout(first, second));
+    second.diskSeq = "41";
+    EXPECT_TRUE(SameLayout(first, second));
+    second.diskBytes = kDisk / 2;
+    EXPECT_FALSE(SameLayout(first, second));
+}
+
+TEST(FsvmTest, MediumBinding) {
+    // No sequence known (a kernel without diskseq): nothing to compare. A disk that does not exist has no medium.
+    EXPECT_TRUE(SameMedium(makedev(179, 0), ""));
+    EXPECT_FALSE(SameMedium(makedev(4095, 1048575), "7"));
+    // A range is refused before anything is set up when the medium differs.
+    std::string node;
+    EXPECT_EQ(-ENODEV, CreateRange("fsvm-test-0", makedev(4095, 1048575), 2048, 8, false, &node, nullptr, "7"));
+    EXPECT_TRUE(node.empty());
 }
 
 TEST(FsvmTest, RangeNames) {

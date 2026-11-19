@@ -71,7 +71,8 @@ status_t PublicVolume::createRange(bool readOnly, std::string* path) {
     // The VM, fsck and the format tools get exactly this partition's sectors, as a device-mapper range of the disk.
     // Android's kernel reads nothing from it and adds no partition to the disk.
     std::string name = fsvm::RangeName(mDevice, mPart.index);
-    status_t res = fsvm::CreateRange(name, mDevice, mPart.start, mPart.length, readOnly, &mRangeNode);
+    status_t res = fsvm::CreateRange(name, mDevice, mPart.start, mPart.length, readOnly, &mRangeNode, nullptr,
+                                     mPart.diskSeq);
     if (res != OK) return res;
     mRangeName = name;
     *path = mRangeNode;
@@ -90,8 +91,9 @@ void PublicVolume::removeRange() {
 status_t PublicVolume::checkInVm() {
     mVmFailed = false;
     if (mInVm) {
-        // The filesystem check runs in the VM, as part of fsvmd's mount, with the fsck_msdos and fsck.exfat vold ran
-        // here before. Not with the same arguments: the VM checks a volume only when it is marked dirty.
+        // The filesystem check runs in the VM, after the mount and outside vold's lock (fsvmd fs.rs Checker), with the
+        // fsck_msdos and fsck.exfat vold ran here before. Not with the same arguments: the VM checks a volume only
+        // when it is marked dirty, and serves it read-only until the check passed.
         if (mPart.unread) {
             LOG(ERROR) << getId() << ": the filesystem VM could not read this disk";
             mVmFailed = true;
@@ -144,17 +146,35 @@ void PublicVolume::onFsvmdExit(pid_t pid) {
     setUnopenable();
 }
 
-void PublicVolume::onCheckDone(pid_t pid, bool writable) {
+void PublicVolume::onCheckDone(pid_t pid, char state) {
     if (pid != mFsvmdPid || getState() != State::kMounted) return;
-    if (writable) {
-        // Apps got EROFS during the check. Nothing to tell the framework, the volume was reported mounted.
-        LOG(INFO) << getId() << ": checked in the filesystem VM, writable now";
-        announceReadOnly(false);
-    } else {
-        // A check that failed keeps the volume read-only: reported so, with SystemUI's read-only notice.
-        LOG(WARNING) << getId() << ": the check in the filesystem VM did not pass, it stays read-only";
-        announceReadOnly(true);
+    // The volume was reported read-only while the VM checked it (Mount, c): writable once the check passed.
+    switch (state) {
+        case 'W':
+            LOG(INFO) << getId() << ": checked in the filesystem VM, writable now";
+            announceReadOnly(false);
+            break;
+        case 'c':
+            LOG(WARNING) << getId() << ": a new filesystem VM checks the volume again, read-only meanwhile";
+            announceReadOnly(true);
+            break;
+        default:
+            // A check that failed keeps the volume read-only, with SystemUI's read-only notice.
+            LOG(WARNING) << getId() << ": the check in the filesystem VM did not pass, it stays read-only";
+            announceReadOnly(true);
+            break;
     }
+}
+
+void PublicVolume::dropMedium() {
+    // A card swapped in a USB reader: a write back would reach the new card at the old one's offsets. The disk has
+    // cut the ranges off already (fsvm::FailRangesOf), a whole-disk volume's VM holds the disk itself.
+    if (mFsvmdPid <= 0) return;
+    LOG(WARNING) << getId() << ": the medium changed, its VM stops without writing back";
+    fsvm::Kill(mFsvmdPid);
+    fsvm::Served(false, false);
+    mFsvmdPid = -1;
+    mWriteBackFailed = true;
 }
 
 status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
@@ -194,6 +214,12 @@ status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
         if (range) removeRange();
         return -EINVAL;
     }
+    // A whole-disk volume's VM gets the disk itself: only while it holds the medium the probe read (a range checks
+    // that as it is set up).
+    if (mInVm && !range && !fsvm::SameMedium(mDevice, mPart.diskSeq)) {
+        LOG(ERROR) << getId() << ": the medium changed since it was read, not serving it";
+        return -ENODEV;
+    }
     if (range) {
         // The partition alone, as a disk of its own: the filesystem starts at its first sector.
         v.diskBytes = mPart.length * 512;
@@ -230,8 +256,8 @@ status_t PublicVolume::mountInVm(gid_t gid) {
         return -EIO;
     }
     // Served read-only by the VM (a write-protected card, or its driver found an error): the user gets a notice. A
-    // volume marked dirty is served read-only while the VM checks it after the mount, and reported mounted: apps get
-    // EROFS until the check passed (onCheckDone).
+    // volume marked dirty is served read-only while the VM checks it after the mount, and reported so until the
+    // check passed (onCheckDone).
     if (servedReadOnly) LOG(WARNING) << getId() << ": served read-only by the filesystem VM";
     setReportReadOnly(servedReadOnly);
     return OK;
@@ -294,7 +320,7 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
         LOG(WARNING) << getId() << " failed to wipe";
     }
     // In the VM, as everything else that touches the volume's filesystem: no mkfs runs on Android.
-    res = fsvm::Format(dev, pick);
+    res = fsvm::Format(dev, pick, mDevice, mPart.diskSeq);
     removeRange();
     if (res != OK) {
         LOG(ERROR) << getId() << " failed to format";
@@ -313,7 +339,9 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
     if (fsvm::Probe(mDiskDevPath, mDiskBytes, &layout, 10000) == OK) {
         for (const auto& p : layout.parts) {
             if (p.index == mPart.index && p.start == mPart.start && p.length == mPart.length && p.fsType == pick) {
+                std::string seq = mPart.diskSeq;
                 mPart = p;
+                mPart.diskSeq = seq;
                 return OK;
             }
         }

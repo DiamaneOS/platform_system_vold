@@ -114,8 +114,9 @@ class VolumeBase {
 
     /* DiamaneOS: the fsvmd serving this volume ended on its own (vold's lock is held) */
     virtual void onFsvmdExit(pid_t pid) {}
-    /* DiamaneOS: the VM's check after the mount ended: writable now, or it stays read-only (vold's lock is held) */
-    virtual void onCheckDone(pid_t pid, bool writable) {}
+    /* DiamaneOS: what fsvmd says of the VM's check after the mount (vold's lock is held): 'W' writable now, 'F' it
+     * stays read-only, 'c' a new VM checks it again, read-only meanwhile */
+    virtual void onCheckDone(pid_t pid, char state) {}
     /* DiamaneOS: the volume is about to go with others of its disk: start writing it back now (PublicVolume) */
     virtual void prepareStop() {}
 

@@ -46,8 +46,9 @@ class PrivateVolume : public VolumeBase {
     const std::string& getRawDevPath() const { return mRawDevPath; };
     const std::string& getRawDmDevPath() const { return mDmDevPath; };
     const std::string& getFsUuid() const { return mFsUuid; };
+    dev_t getRawDevice() const { return mRawDevice; };
     /* DiamaneOS: the number the volume IDs are made from (the raw device, but for a range of a card) */
-    dev_t getRawDevice() const { return mIdDevice; };
+    dev_t getIdDevice() const { return mIdDevice; };
 
   protected:
     status_t doCreate() override;
@@ -62,7 +63,7 @@ class PrivateVolume : public VolumeBase {
   private:
     /* Kernel device of raw, encrypted partition */
     dev_t mRawDevice;
-    /* DiamaneOS: see getRawDevice */
+    /* DiamaneOS: see getIdDevice */
     dev_t mIdDevice;
     /* Path to raw, encrypted block device */
     std::string mRawDevPath;

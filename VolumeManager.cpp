@@ -417,7 +417,7 @@ void VolumeManager::createEmulatedVolumesForUser(userid_t userId) {
         if (pvol->getState() == VolumeBase::State::kMounted) {
             auto evol =
                     std::shared_ptr<android::vold::VolumeBase>(new android::vold::EmulatedVolume(
-                            pvol->getPath() + "/media", pvol->getRawDevice(), pvol->getFsUuid(),
+                            pvol->getPath() + "/media", pvol->getIdDevice() /* DiamaneOS */, pvol->getFsUuid(),
                             userId));
             evol->setMountUserId(userId);
             pvol->addVolume(evol);

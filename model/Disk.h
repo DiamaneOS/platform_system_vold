@@ -131,6 +131,8 @@ class Disk {
     void removeRanges();
     /* Asks every volume of the disk to start writing back, before they are stopped one by one */
     void prepareStopAll();
+    /* The medium changed: the old one's ranges fail all I/O and its VMs end without writing back */
+    void dropOldMedium();
   public:
     enum class Reprobe {
         /* the last probe failed (a protected VM start can be refused for a while after boot) */

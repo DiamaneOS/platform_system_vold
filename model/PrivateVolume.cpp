@@ -47,6 +47,7 @@ namespace vold {
 PrivateVolume::PrivateVolume(dev_t device, const KeyBuffer& keyRaw)
     : PrivateVolume(device, device, keyRaw) {}
 
+/* DiamaneOS: a range of a card (DiskFsvm.cpp createPrivateVolumeInVm), with the partition's IDs */
 PrivateVolume::PrivateVolume(dev_t device, dev_t idDevice, const KeyBuffer& keyRaw)
     : VolumeBase(Type::kPrivate), mRawDevice(device), mIdDevice(idDevice), mKeyRaw(keyRaw) {
     setId(StringPrintf("private:%u,%u", major(idDevice), minor(idDevice)));

@@ -47,12 +47,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
 
-#include "DmWait.h"
 #include "Utils.h"
 #include "VolumeManager.h"
 #include "model/VolumeBase.h"
@@ -94,6 +94,7 @@ static const char* const kObbSlots[] = {"obb_0", "obb_1", "obb_2", "obb_3"};
  *   (a Guard ends fsvmd when FUSE requests hang), the orderly stop at most kSyncMs plus 3 s. At most 47 s. When a
  *   disk goes with several volumes, all of them are asked to write back first (RequestWriteBack) and do so at the
  *   same time, so each later stop finds its fsvmd done.
+ * - ranges: a removal is one try, never a wait (a range still held goes when it is closed, DeleteRange).
  */
 static constexpr int kProbeTimeoutMs = 23000;
 static constexpr int kReadyTimeoutMs = 37000;
@@ -388,6 +389,7 @@ bool OffersFormat(const Layout& l) {
 }
 
 bool SameLayout(const Layout& a, const Layout& b) {
+    if (a.diskSeq != b.diskSeq || a.diskBytes != b.diskBytes) return false;
     if (a.table != b.table || a.parts.size() != b.parts.size()) return false;
     for (size_t i = 0; i < a.parts.size(); i++) {
         const Part &p = a.parts[i], &q = b.parts[i];
@@ -464,12 +466,17 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
 /* fsvmd keeps to 40 s for a format (FORMAT_BUDGET), vold reads for 45 s: under vold's lock, as mkfs ran before. */
 static constexpr int kFormatTimeoutMs = 45000;
 
-status_t Format(const std::string& path, const std::string& fsType) {
+status_t Format(const std::string& path, const std::string& fsType, dev_t disk, const std::string& seq) {
     if (fsType != "vfat" && fsType != "exfat") return -EINVAL;
     unique_fd dev(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDWR | O_CLOEXEC)));
     if (dev < 0) {
         PLOG(ERROR) << "fsvm: opening " << path << " to format it";
         return -errno;
+    }
+    // A format chosen for the medium the probe read, never for one put in since.
+    if (disk && !SameMedium(disk, seq)) {
+        LOG(ERROR) << "fsvm: the medium changed since " << path << " was read, not formatting it";
+        return -ENODEV;
     }
     uint64_t bytes = 0;
     uint32_t blockSize = BlockSize(dev.get());
@@ -499,8 +506,9 @@ status_t Format(const std::string& path, const std::string& fsType) {
 
 /*
  * Waits for fsvmd to end and, when it ended on its own while its volume is still mounted (its VM broke and no new
- * one came up), has the volume unmounted and reported as not opened. Meanwhile passes on the end of the VM's check
- * after the mount (W: writable now, F: it stays read-only), from fsvmd's pipe.
+ * one came up), has the volume unmounted and reported as not opened. Meanwhile passes on what fsvmd says of the VM's
+ * check after the mount, from its pipe: W (writable now), F (it stays read-only), c (a new VM checks it again,
+ * read-only meanwhile).
  */
 static void Watch(unique_fd conn, unique_fd ready, std::string volumeId, pid_t pid) {
     std::thread([conn = std::move(conn), ready = std::move(ready), volumeId, pid]() {
@@ -512,10 +520,10 @@ static void Watch(unique_fd conn, unique_fd ready, std::string volumeId, pid_t p
             if (pfd[0].revents) break;
             if (pfd[1].revents & POLLIN) {
                 char c = 0;
-                if (TEMP_FAILURE_RETRY(read(ready.get(), &c, 1)) == 1 && (c == 'W' || c == 'F')) {
+                if (TEMP_FAILURE_RETRY(read(ready.get(), &c, 1)) == 1 && (c == 'W' || c == 'F' || c == 'c')) {
                     std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
                     auto vol = VolumeManager::Instance()->findVolume(volumeId);
-                    if (vol) vol->onCheckDone(pid, c == 'W');
+                    if (vol) vol->onCheckDone(pid, c);
                     continue;
                 }
             }
@@ -583,14 +591,16 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
     if (TEMP_FAILURE_RETRY(poll(&pfd, 1, kReadyTimeoutMs)) == 1 &&
         TEMP_FAILURE_RETRY(read(readyRead.get(), &c, 1)) == 1 && (c == 'R' || c == 'r' || c == 'c')) {
         // r: asked for writing, served read-only by the VM. c: marked dirty, read-only while the VM checks it, then
-        // W or F on the same pipe (fsvmd main.rs).
-        if (servedReadOnly) *servedReadOnly = c == 'r';
+        // W or F on the same pipe (fsvmd main.rs). Both are reported read-only: apps would get EROFS from a volume
+        // reported writable.
+        if (servedReadOnly) *servedReadOnly = c == 'r' || c == 'c';
         LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child
                   << (c == 'c' ? ", read-only while the VM checks it" : "");
         *pid = child;
         if (!v.obb) sServing++;
         if (conn >= 0) {
-            if (c != 'c') readyRead.reset();
+            // A card's pipe stays open for the check's end, and for a check a new VM starts after a broken session.
+            if (v.obb) readyRead.reset();
             Watch(std::move(conn), std::move(readyRead), v.volumeId, child);
         } else {
             PLOG(WARNING) << "fsvm: fsvmd " << child << " is not watched";
@@ -620,6 +630,12 @@ int Stop(pid_t pid, bool orderly) {
 void RequestStop(pid_t pid) {
     unique_fd conn = Connection(pid);
     if (conn >= 0) Tell(conn.get(), 'T');
+}
+
+void Kill(pid_t pid) {
+    if (pid <= 0) return;
+    Reap(pid, 0, 0);
+    LOG(WARNING) << "fsvm: fsvmd " << pid << " killed without writing back";
 }
 
 void RequestWriteBack(pid_t pid) {
@@ -727,10 +743,22 @@ std::string RangeName(dev_t disk, uint32_t index) {
     return RangePrefix(disk) + std::to_string(index);
 }
 
+bool SameMedium(dev_t disk, const std::string& seq) {
+    if (seq.empty()) return true;
+    std::string now;
+    android::base::ReadFileToString(StringPrintf("/sys/dev/block/%u:%u/diskseq", major(disk), minor(disk)), &now);
+    return android::base::Trim(now) == android::base::Trim(seq);
+}
+
 status_t CreateRange(const std::string& name, dev_t disk, uint64_t start, uint64_t length, bool readOnly,
-                     std::string* node, dev_t* dev) {
+                     std::string* node, dev_t* dev, const std::string& seq) {
     node->clear();
     if (length == 0 || start > UINT64_MAX / 512 - length) return -EINVAL;
+    // Only over the medium the range was read from (a card swapped in a USB reader keeps the disk).
+    if (!SameMedium(disk, seq)) {
+        LOG(ERROR) << "fsvm: the medium changed since it was read, no range " << name;
+        return -ENODEV;
+    }
     auto& dm = android::dm::DeviceMapper::Instance();
     // A range left from before (vold restarted while it existed) goes first.
     DeleteRange(name, "/dev/block/vold/" + name);
@@ -743,20 +771,27 @@ status_t CreateRange(const std::string& name, dev_t disk, uint64_t start, uint64
     table.set_readonly(readOnly);
     std::string path;
     if (!dm.CreateDevice(name, table, &path, std::chrono::seconds(5))) {
+        // Also a range of the same name a VM still holds, waiting for its deferred removal: the mount is tried again.
         PLOG(ERROR) << "fsvm: creating the range " << name;
         return -EIO;
     }
     struct stat st;
     if (stat(path.c_str(), &st) || !S_ISBLK(st.st_mode)) {
         PLOG(ERROR) << "fsvm: the range " << name << " has no device";
-        DeleteDmDeviceWaiting(name, true);
+        DeleteRange(name, "");
         return -EIO;
+    }
+    // The medium may have changed while the range was set up: then it goes again, before anything used it.
+    if (!SameMedium(disk, seq)) {
+        LOG(ERROR) << "fsvm: the medium changed while the range " << name << " was set up";
+        DeleteRange(name, "");
+        return -ENODEV;
     }
     // vold's own node for it, labelled vold_device like the disk's: only fsvmd's VM manager and crosvm may use it,
     // through the descriptor vold opens.
     std::string n = "/dev/block/vold/" + name;
     if (CreateDeviceNode(n, st.st_rdev) != OK) {
-        DeleteDmDeviceWaiting(name, true);
+        DeleteRange(name, "");
         return -EIO;
     }
     *node = n;
@@ -768,19 +803,61 @@ status_t CreateRange(const std::string& name, dev_t disk, uint64_t start, uint64
 
 status_t DeleteRange(const std::string& name, const std::string& node) {
     if (!node.empty()) DestroyDeviceNode(node);
-    // A VM that just stopped may hold it for a moment: DeleteDmDeviceWaiting retries for 10 s.
-    return DeleteDmDeviceWaiting(name, true) ? OK : -EBUSY;
+    auto& dm = android::dm::DeviceMapper::Instance();
+    // One try. A VM that is slow to end, or stuck on a stalled USB disk, still holds it: the kernel then removes it
+    // once it is closed (deferred removal), and vold, which holds its lock here, never waits for that.
+    if (dm.DeleteDeviceIfExists(name)) return OK;
+    if (errno == EBUSY && dm.DeleteDeviceIfExistsDeferred(name)) {
+        LOG(WARNING) << "fsvm: range " << name << " still in use, removed as soon as it is closed";
+        return OK;
+    }
+    PLOG(ERROR) << "fsvm: removing the range " << name;
+    return -EBUSY;
+}
+
+static void ForEachRange(const std::string& prefix, const std::function<void(const std::string&)>& fn) {
+    std::vector<android::dm::DeviceMapper::DmBlockDevice> devices;
+    if (!android::dm::DeviceMapper::Instance().GetAvailableDevices(&devices)) return;
+    for (const auto& d : devices) {
+        if (android::base::StartsWith(d.name(), prefix)) fn(d.name());
+    }
 }
 
 void DeleteRangesOf(dev_t disk) {
-    std::vector<android::dm::DeviceMapper::DmBlockDevice> devices;
-    if (!android::dm::DeviceMapper::Instance().GetAvailableDevices(&devices)) return;
-    const std::string prefix = RangePrefix(disk);
-    for (const auto& d : devices) {
-        if (!android::base::StartsWith(d.name(), prefix)) continue;
-        LOG(WARNING) << "fsvm: removing the range " << d.name() << " left from before";
-        DeleteRange(d.name(), "/dev/block/vold/" + d.name());
-    }
+    ForEachRange(RangePrefix(disk), [](const std::string& name) {
+        LOG(WARNING) << "fsvm: removing the range " << name << " left from before";
+        DeleteRange(name, "/dev/block/vold/" + name);
+    });
+}
+
+void FailRangesOf(dev_t disk) {
+    auto& dm = android::dm::DeviceMapper::Instance();
+    ForEachRange(RangePrefix(disk), [&dm](const std::string& name) {
+        std::vector<android::dm::DeviceMapper::TargetInfo> targets;
+        uint64_t sectors = 0;
+        if (dm.GetTableInfo(name, &targets)) {
+            for (const auto& t : targets) sectors = std::max<uint64_t>(sectors, t.spec.sector_start + t.spec.length);
+        }
+        android::dm::DmTable table;
+        if (!sectors || !table.Emplace<android::dm::DmTargetError>(0, sectors) ||
+            !dm.LoadTableAndActivate(name, table)) {
+            PLOG(ERROR) << "fsvm: the range " << name << " could not be cut off from the changed medium";
+            return;
+        }
+        LOG(WARNING) << "fsvm: the medium changed, the range " << name << " fails all I/O now";
+    });
+}
+
+void SweepRanges() {
+    ForEachRange("fsvm-", [](const std::string& name) {
+        unsigned maj = 0, min = 0, index = 0;
+        char end = 0;
+        if (sscanf(name.c_str(), "fsvm-%u-%u-%u%c", &maj, &min, &index, &end) != 3) return;
+        // The disk is still there: its own probe removes what it left (DeleteRangesOf).
+        if (access(StringPrintf("/sys/dev/block/%u:%u", maj, min).c_str(), F_OK) == 0) return;
+        LOG(WARNING) << "fsvm: removing the range " << name << " of a disk that is gone";
+        DeleteRange(name, "/dev/block/vold/" + name);
+    });
 }
 
 status_t DeleteAllPartitions(const std::string& diskPath, const std::string& diskSysPath) {

@@ -56,11 +56,18 @@ struct Part {
      * can read (a new card, ext4, NTFS). Only such a partition is offered for formatting.
      */
     bool noFsConfirmed = false;
+    /* The disk's medium sequence (/sys/block/<disk>/diskseq) the probe that found this saw, empty when the kernel has
+     * none: a range, a mount or a format of it is refused on another medium (SameMedium) */
+    std::string diskSeq;
 };
 
 struct Layout {
     std::string table; /* "none", "mbr" or "gpt" */
     std::vector<Part> parts;
+    /* The medium sequence and size of the disk the probe read (set by Disk): two answers are the same only for the
+     * same medium */
+    std::string diskSeq;
+    uint64_t diskBytes = 0;
 };
 
 /* Has the filesystem VM read the partition table of the disk at `diskPath`. A `timeoutMs` shorter than the default
@@ -69,8 +76,12 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
 
 /* Formats the block device at `path` (a partition's range, or a whole-disk volume) as `fsType` ("vfat" or "exfat")
  * in a filesystem VM, with the pinned tree's newfs_msdos or mkfs.exfat and vold's former arguments. No mkfs runs on
- * Android for a card or USB drive. */
-status_t Format(const std::string& path, const std::string& fsType);
+ * Android for a card or USB drive. Refused when `disk` no longer holds the medium `seq` (SameMedium). */
+status_t Format(const std::string& path, const std::string& fsType, dev_t disk = 0, const std::string& seq = "");
+
+/* Whether `disk` still holds the medium whose sequence number (diskseq) a probe saw as `seq`. An empty `seq` (a
+ * kernel without diskseq) always matches. */
+bool SameMedium(dev_t disk, const std::string& seq);
 
 /*
  * Parses and checks fsvmd's probe output (exposed for vold_tests). `blockSize`: the disk's logical block size, which
@@ -123,6 +134,9 @@ static constexpr int kExitNotWrittenBack = 3;
 /* Asks fsvmd to stop now, without waiting: Stop then reaps it. For stopping several at once. */
 void RequestStop(pid_t pid);
 
+/* Kills fsvmd at once, with no write back (its volume's medium is gone), and reaps it. */
+void Kill(pid_t pid);
+
 /* Asks fsvmd to write its volume back and end, with the full time for it, without waiting: several volumes of a disk
  * that goes write back together, and each Stop then finds its fsvmd done. */
 void RequestWriteBack(pid_t pid);
@@ -156,15 +170,22 @@ class Guard {
  * `start` to `start + length` of `disk`, the range the VM read. A partition's VM, its format and adoptable storage get
  * such a range instead of the whole disk, so one partition's VM cannot reach another. The kernel reads no table on
  * it (device-mapper disks carry GENHD_FL_NO_PART). Returns vold's node for it (/dev/block/vold/<name>, labelled
- * vold_device like the disk's) in `node` and its device in `dev`.
+ * vold_device like the disk's) in `node` and its device in `dev`. Refused unless `disk` holds the medium `seq` the
+ * range was read from, before and after it is set up (SameMedium).
  */
 std::string RangeName(dev_t disk, uint32_t index);
 status_t CreateRange(const std::string& name, dev_t disk, uint64_t start, uint64_t length, bool readOnly,
-                     std::string* node, dev_t* dev = nullptr);
-/* Removes a range and its node. Waits up to 10 s while a VM that just stopped still holds it. */
+                     std::string* node, dev_t* dev = nullptr, const std::string& seq = "");
+/* Removes a range and its node. Never waits: a range a VM still holds is removed by the kernel once it is closed
+ * (deferred removal). */
 status_t DeleteRange(const std::string& name, const std::string& node);
 /* Removes every range of `disk` left from before (vold restarted, a medium changed). */
 void DeleteRangesOf(dev_t disk);
+/* Turns every range of `disk` into one that fails all I/O: the medium under them changed, and nothing written for the
+ * old one (a VM's write back, a private volume's unmount) may reach the new one at the old one's offsets. */
+void FailRangesOf(dev_t disk);
+/* Removes the ranges of disks that are gone (unplugged while a VM still held a range). */
+void SweepRanges();
 
 status_t DeletePartition(const std::string& diskPath, uint32_t index);
 /*
