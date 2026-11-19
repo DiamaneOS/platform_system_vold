@@ -264,8 +264,9 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
         LOG(ERROR) << getId() << ": the filesystem VM could not read this volume, not formatting it";
         return -EIO;
     }
-    bool isVfatSup = vfat::IsSupported();
-    bool isExfatSup = exfat::IsSupported();
+    // Both are formatted in the VM, whatever mkfs tools Android has.
+    bool isVfatSup = true;
+    bool isExfatSup = true;
     std::string pick;
     if (fsType == "auto") {
         // As for kernel mounted cards: exFAT for SDXC (>~32GiB) cards when both are supported.
@@ -292,7 +293,8 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
     if (WipeBlockDevice(dev) != OK) {
         LOG(WARNING) << getId() << " failed to wipe";
     }
-    res = pick == "vfat" ? vfat::Format(dev, 0) : exfat::Format(dev);
+    // In the VM, as everything else that touches the volume's filesystem: no mkfs runs on Android.
+    res = fsvm::Format(dev, pick);
     removeRange();
     if (res != OK) {
         LOG(ERROR) << getId() << " failed to format";

@@ -67,6 +67,11 @@ struct Layout {
  * (the check after a format) ends the probe early. */
 status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int timeoutMs = 0);
 
+/* Formats the block device at `path` (a partition's range, or a whole-disk volume) as `fsType` ("vfat" or "exfat")
+ * in a filesystem VM, with the pinned tree's newfs_msdos or mkfs.exfat and vold's former arguments. No mkfs runs on
+ * Android for a card or USB drive. */
+status_t Format(const std::string& path, const std::string& fsType);
+
 /*
  * Parses and checks fsvmd's probe output (exposed for vold_tests). `blockSize`: the disk's logical block size, which
  * sets how much room a GPT takes at either end (34 and 33 sectors for 512-byte blocks, 48 and 40 for 4096).

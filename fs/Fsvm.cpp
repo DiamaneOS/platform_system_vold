@@ -212,7 +212,9 @@ static pid_t SpawnOn(const char* slot, const std::vector<std::string>& args, int
 
 /* The first free slot of the request's kind (a probe, an OBB image or a volume) runs fsvmd. */
 static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
-    const bool probe = !args.empty() && args[0] == "--probe", obb = !args.empty() && args[0] == "--obb";
+    // A format runs where probes run (the probe slot), one at a time under vold's lock.
+    const bool probe = !args.empty() && (args[0] == "--probe" || args[0] == "--format");
+    const bool obb = !args.empty() && args[0] == "--obb";
     const char* const* slots = probe ? kProbeSlots : obb ? kObbSlots : kVolumeSlots;
     size_t n = probe ? std::size(kProbeSlots) : obb ? std::size(kObbSlots) : std::size(kVolumeSlots);
     for (size_t i = 0; i < n; i++) {
@@ -220,7 +222,7 @@ static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int f
         if (pid > 0) return pid;
         if (errno != EBUSY && errno != ECONNREFUSED && errno != ENOENT && errno != EAGAIN) return -1;
     }
-    LOG(ERROR) << "fsvm: no free fsvmd slot for " << (probe ? "a probe" : obb ? "an OBB image" : "a volume");
+    LOG(ERROR) << "fsvm: no free fsvmd slot for " << (probe ? "a probe or format" : obb ? "an OBB image" : "a volume");
     errno = EBUSY;
     return -1;
 }
@@ -456,6 +458,42 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
     }
     LOG(INFO) << "fsvm: " << diskPath << " has a " << out->table << " table with " << out->parts.size()
               << " partitions Android uses";
+    return OK;
+}
+
+/* fsvmd keeps to 40 s for a format (FORMAT_BUDGET), vold reads for 45 s: under vold's lock, as mkfs ran before. */
+static constexpr int kFormatTimeoutMs = 45000;
+
+status_t Format(const std::string& path, const std::string& fsType) {
+    if (fsType != "vfat" && fsType != "exfat") return -EINVAL;
+    unique_fd dev(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDWR | O_CLOEXEC)));
+    if (dev < 0) {
+        PLOG(ERROR) << "fsvm: opening " << path << " to format it";
+        return -errno;
+    }
+    uint64_t bytes = 0;
+    uint32_t blockSize = BlockSize(dev.get());
+    if (GetBlockDevSize(dev.get(), &bytes) != OK || bytes < 512 || !blockSize) return -EINVAL;
+    int p[2];
+    if (pipe2(p, O_CLOEXEC)) return -errno;
+    unique_fd rd(p[0]), wr(p[1]);
+    pid_t child = Spawn({"--format", fsType, "--disk-bytes", std::to_string(bytes & ~511ULL), "--block-size",
+                         std::to_string(blockSize)},
+                        dev.get(), -1, wr.get());
+    if (child < 0) {
+        LOG(ERROR) << "fsvm: fsvmd did not start to format " << path;
+        return -EIO;
+    }
+    wr.reset();
+    dev.reset();
+    std::string text;
+    status_t res = ReadAll(rd.get(), NowMs() + kFormatTimeoutMs, 16, &text);
+    int rc = Reap(child, res == OK ? 3000 : 0, 0);
+    if (res != OK || rc != 0 || text != "OK\n") {
+        LOG(ERROR) << "fsvm: the filesystem VM did not format " << path << " (" << res << ", exit " << rc << ")";
+        return -EIO;
+    }
+    LOG(INFO) << "fsvm: " << path << " formatted as " << fsType << " in the filesystem VM";
     return OK;
 }
 
