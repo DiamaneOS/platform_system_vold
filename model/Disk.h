@@ -20,6 +20,7 @@
 #include "StubVolume.h"
 #include "Utils.h"
 #include "VolumeBase.h"
+#include "fs/Fsvm.h"
 
 #include <utils/Errors.h>
 
@@ -120,6 +121,9 @@ class Disk {
     void createPublicVolume(dev_t device);
     void createPrivateVolume(dev_t device, const std::string& partGuid);
     void createStubVolume();
+
+    /* DiamaneOS: the filesystem VM's members (DiskFsvm.cpp), private when it ends */
+#include "model/DiskFsvm.inc"
 
     void destroyAllVolumes();
 

@@ -46,10 +46,11 @@ VolumeBase::~VolumeBase() {
 
 void VolumeBase::setState(State state) {
     mState = state;
+    if (state != State::kMounted) mReportReadOnly = false;  // DiamaneOS: see announceReadOnly
 
     auto listener = getListener();
     if (listener) {
-        listener->onVolumeStateChanged(getId(), static_cast<int32_t>(mState),
+        listener->onVolumeStateChanged(getId(), static_cast<int32_t>(reportedState()),  // DiamaneOS
                                        static_cast<int32_t>(mMountUserId));
     }
 }
@@ -75,7 +76,7 @@ status_t VolumeBase::setPartGuid(const std::string& partGuid) {
 }
 
 status_t VolumeBase::setMountFlags(int mountFlags) {
-    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+    if (!mayMount()) {  // DiamaneOS: also unopenable and not written back
         LOG(WARNING) << getId() << " flags change requires state unmounted or unmountable";
         return -EBUSY;
     }
@@ -85,7 +86,7 @@ status_t VolumeBase::setMountFlags(int mountFlags) {
 }
 
 status_t VolumeBase::setMountUserId(userid_t mountUserId) {
-    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+    if (!mayMount()) {  // DiamaneOS: also unopenable and not written back
         LOG(WARNING) << getId() << " user change requires state unmounted or unmountable";
         return -EBUSY;
     }
@@ -224,14 +225,14 @@ status_t VolumeBase::doDestroy() {
 }
 
 status_t VolumeBase::mount() {
-    if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
+    if (!mayMount()) {  // DiamaneOS: also unopenable and not written back
         LOG(WARNING) << getId() << " mount requires state unmounted or unmountable";
         return -EBUSY;
     }
 
     setState(State::kChecking);
     status_t res = doMount();
-    setState(res == OK ? State::kMounted : State::kUnmountable);
+    if (res == OK) setState(State::kMounted); else mountFailed();  // DiamaneOS: VolumeBaseFsvm.cpp
 
     if (res == OK) {
         doPostMount();
@@ -242,6 +243,7 @@ status_t VolumeBase::mount() {
 void VolumeBase::doPostMount() {}
 
 status_t VolumeBase::unmount() {
+    if (mState == State::kChecking && cancelRepairInVm()) return OK;  // DiamaneOS: an eject stops a repair
     if (mState != State::kMounted) {
         LOG(WARNING) << getId() << " unmount requires state mounted";
         return -EBUSY;
@@ -256,7 +258,7 @@ status_t VolumeBase::unmount() {
     mVolumes.clear();
 
     status_t res = doUnmount();
-    setState(State::kUnmounted);
+    setState(writeBackFailed() ? State::kNotWrittenBack : State::kUnmounted);  // DiamaneOS: not safe to remove
     return res;
 }
 
@@ -265,6 +267,7 @@ status_t VolumeBase::format(const std::string& fsType) {
         unmount();
     }
 
+    // DiamaneOS: never a volume the filesystem VM could not open (kUnopenable), as the user decided.
     if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
         LOG(WARNING) << getId() << " format requires state unmounted or unmountable";
         return -EBUSY;

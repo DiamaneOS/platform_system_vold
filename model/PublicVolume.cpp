@@ -59,6 +59,7 @@ PublicVolume::PublicVolume(dev_t device) : VolumeBase(Type::kPublic), mDevice(de
 PublicVolume::~PublicVolume() {}
 
 status_t PublicVolume::readMetadata() {
+    if (mInVm) return readMetadataInVm();  // DiamaneOS: what the filesystem VM read
     status_t res = ReadMetadataUntrusted(mDevPath, &mFsType, &mFsUuid, &mFsLabel);
 
     auto listener = getListener();
@@ -100,10 +101,12 @@ std::string PublicVolume::getStableName() {
 }
 
 status_t PublicVolume::doCreate() {
+    if (mInVm) return OK;  // DiamaneOS: a volume the VM serves uses the whole disk's node
     return CreateDeviceNode(mDevPath, mDevice);
 }
 
 status_t PublicVolume::doDestroy() {
+    if (mInVm) return destroyInVm();  // DiamaneOS
     return DestroyDeviceNode(mDevPath);
 }
 
@@ -111,6 +114,9 @@ status_t PublicVolume::doMount() {
     bool isVisible = isVisibleForWrite();
     readMetadata();
 
+#ifdef VOLD_PUBLIC_FS_IN_VM  // DiamaneOS: only the filesystem VM's kernel parses the volume (PublicVolumeFsvm.cpp)
+    if (status_t res = checkInVm(); res != OK) return res;
+#else
     if (mFsType == "vfat" && vfat::IsSupported()) {
         if (vfat::Check(mDevPath)) {
             LOG(ERROR) << getId() << " failed filesystem check";
@@ -125,6 +131,7 @@ status_t PublicVolume::doMount() {
         LOG(ERROR) << getId() << " unsupported filesystem " << mFsType;
         return -EIO;
     }
+#endif
 
     std::string stableName = getStableName();
 
@@ -147,6 +154,10 @@ status_t PublicVolume::doMount() {
         return -errno;
     }
 
+#ifdef VOLD_PUBLIC_FS_IN_VM  // DiamaneOS: fsvmd serves it from a protected VM, no fallback (PublicVolumeFsvm.cpp)
+    if (status_t res = mountInVm(isVisible ? AID_MEDIA_RW : AID_EXTERNAL_STORAGE); res != OK) return res;
+    fsvm::Guard guard(mFsvmdPid, guardMs());
+#else
     if (mFsType == "vfat") {
         if (vfat::Mount(mDevPath, mRawPath, false, false, false, AID_ROOT,
                         (isVisible ? AID_MEDIA_RW : AID_EXTERNAL_STORAGE), 0007, true)) {
@@ -160,6 +171,7 @@ status_t PublicVolume::doMount() {
             return -EIO;
         }
     }
+#endif
 
     if (getMountFlags() & MountFlags::kPrimary) {
         initAsecStage();
@@ -307,6 +319,7 @@ status_t PublicVolume::bindMountForUser(userid_t user_id) {
 }
 
 status_t PublicVolume::doUnmount() {
+    DIAMANEOS_FS_IN_VM(UnmountInVm inVm(this);)  // DiamaneOS: fsvmd stops on every way out (PublicVolumeFsvm.cpp)
     // Unmount the storage before we kill the FUSE process. If we kill
     // the FUSE process first, most file system operations will return
     // ENOTCONN until the unmount completes. This is an exotic and unusual
@@ -388,6 +401,7 @@ status_t PublicVolume::doUnmount() {
         umount2(mRawPath.c_str(),MNT_DETACH);
         PLOG(INFO) << "use umount lazy if force unmount fail";
     }
+    DIAMANEOS_FS_IN_VM(inVm.fuseGone();)  // DiamaneOS: FUSE is gone, fsvmd writes back and stops
     if(rmdir(mRawPath.c_str()) != 0) {
         PLOG(INFO) << "rmdir mRawPath=" << mRawPath << " fail";
         KillProcessesUsingPath(getPath());
@@ -398,6 +412,7 @@ status_t PublicVolume::doUnmount() {
 }
 
 status_t PublicVolume::doFormat(const std::string& fsType) {
+    DIAMANEOS_FS_IN_VM(if (mInVm) return formatInVm(fsType);)  // DiamaneOS: formats run in the VM
     bool isVfatSup = vfat::IsSupported();
     bool isExfatSup = exfat::IsSupported();
     status_t res = OK;

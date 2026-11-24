@@ -162,6 +162,7 @@ status_t Disk::create() {
 
 status_t Disk::destroy() {
     CHECK(mCreated);
+    DIAMANEOS_FS_IN_VM(beforeDestroyInVm();)  // DiamaneOS: DiskFsvm.cpp
     destroyAllVolumes();
     mCreated = false;
 
@@ -229,10 +230,12 @@ void Disk::createStubVolume() {
 }
 
 void Disk::destroyAllVolumes() {
+    DIAMANEOS_FS_IN_VM(prepareStopAll();)  // DiamaneOS: all volumes of the disk write back at once
     for (const auto& vol : mVolumes) {
         vol->destroy();
     }
     mVolumes.clear();
+    DIAMANEOS_FS_IN_VM(removeRanges();)  // DiamaneOS: and their device-mapper ranges go
 }
 
 status_t Disk::readMetadata() {
@@ -326,6 +329,8 @@ status_t Disk::readPartitions() {
     if (maxMinors < 0) {
         return -ENOTSUP;
     }
+
+    DIAMANEOS_FS_IN_VM(if (isVmDisk()) return readPartitionsInVm(maxMinors);)  // DiamaneOS: read in the VM
 
     destroyAllVolumes();
 
@@ -437,6 +442,7 @@ void Disk::initializePartition(std::shared_ptr<StubVolume> vol) {
 }
 
 status_t Disk::unmountAll() {
+    DIAMANEOS_FS_IN_VM(prepareStopAll();)  // DiamaneOS
     for (const auto& vol : mVolumes) {
         vol->unmount();
     }
@@ -446,6 +452,7 @@ status_t Disk::unmountAll() {
 status_t Disk::partitionPublic() {
     int res;
 
+    DIAMANEOS_FS_IN_VM(if (status_t r = beforePartitionInVm(); r != OK) return r;)  // DiamaneOS: DiskFsvm.cpp
     destroyAllVolumes();
     mJustPartitioned = true;
 
@@ -475,6 +482,7 @@ status_t Disk::partitionPublic() {
         return res;
     }
 
+    DIAMANEOS_FS_IN_VM(if (isVmDisk()) return readPartitions();)  // DiamaneOS: the VM reads the new table
     return OK;
 }
 
@@ -485,6 +493,7 @@ status_t Disk::partitionPrivate() {
 status_t Disk::partitionMixed(int8_t ratio) {
     int res;
 
+    DIAMANEOS_FS_IN_VM(if (status_t r = beforePartitionInVm(); r != OK) return r;)  // DiamaneOS: DiskFsvm.cpp
     destroyAllVolumes();
     mJustPartitioned = true;
 
@@ -564,6 +573,7 @@ status_t Disk::partitionMixed(int8_t ratio) {
         return res;
     }
 
+    DIAMANEOS_FS_IN_VM(if (isVmDisk()) return readPartitions();)  // DiamaneOS: the VM reads the new table
     return OK;
 }
 

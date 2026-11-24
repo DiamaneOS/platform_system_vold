@@ -415,9 +415,10 @@ void VolumeManager::createEmulatedVolumesForUser(userid_t userId) {
     for (const std::string& id : private_vols) {
         PrivateVolume* pvol = static_cast<PrivateVolume*>(findVolume(id).get());
         if (pvol->getState() == VolumeBase::State::kMounted) {
+            // DiamaneOS: a card's adoptable storage keeps its partition's IDs (PrivateVolume::getIdDevice)
             auto evol =
                     std::shared_ptr<android::vold::VolumeBase>(new android::vold::EmulatedVolume(
-                            pvol->getPath() + "/media", pvol->getRawDevice(), pvol->getFsUuid(),
+                            pvol->getPath() + "/media", pvol->getIdDevice(), pvol->getFsUuid(),
                             userId));
             evol->setMountUserId(userId);
             pvol->addVolume(evol);
@@ -1181,8 +1182,10 @@ int VolumeManager::fixupAppDir(const std::string& path, int32_t appUid) {
     return setupAppDir(path, appUid, true /* fixupExistingOnly */);
 }
 
-int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
+// DiamaneOS: userId, the caller's user (IVold.aidl)
+int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid, int32_t userId,
                              std::string* outVolId) {
+    if (userId < 0) return -EINVAL;
     int id = mNextObbId++;
 
     std::string lowerSourcePath;
@@ -1220,7 +1223,7 @@ int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
     }
 
     auto vol = std::shared_ptr<android::vold::VolumeBase>(
-            new android::vold::ObbVolume(id, lowerSourcePath, ownerGid));
+            new android::vold::ObbVolume(id, lowerSourcePath, ownerGid, static_cast<userid_t>(userId)));
     vol->create();
 
     mObbVolumes.push_back(vol);

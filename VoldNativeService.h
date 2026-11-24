@@ -73,7 +73,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
     binder::Status setupAppDir(const std::string& path, int32_t appUid);
     binder::Status fixupAppDir(const std::string& path, int32_t appUid);
 
-    binder::Status createObb(const std::string& sourcePath, int32_t ownerGid,
+    // DiamaneOS: userId, the caller's user (IVold.aidl)
+    binder::Status createObb(const std::string& sourcePath, int32_t ownerGid, int32_t userId,
                              std::string* _aidl_return);
     binder::Status destroyObb(const std::string& volId);
 
