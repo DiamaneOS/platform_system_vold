@@ -16,6 +16,7 @@
 
 #include "Disk.h"
 #include "FsCrypt.h"
+#include "NewAdoption.h"  // DiamaneOS
 #include "PrivateVolume.h"
 #include "PublicVolume.h"
 #include "RandUtils.h"
@@ -224,6 +225,7 @@ void Disk::createStubVolume() {
     CHECK(mVolumes.size() == 1);
     auto listener = VolumeManager::Instance()->getListener();
     if (listener) listener->onDiskMetadataChanged(getId(), mSize, mLabel, mSysPath);
+    if (listener) listener->onDiskFormatOffer(getId(), mVolumes.empty());  // DiamaneOS: stock's rule
     if (listener) listener->onDiskScanned(getId());
     mVolumes[0]->setDiskId(getId());
     mVolumes[0]->create();
@@ -347,6 +349,7 @@ status_t Disk::readPartitions() {
         LOG(WARNING) << "sgdisk failed to scan " << mDevPath;
 
         auto listener = VolumeManager::Instance()->getListener();
+        if (listener) listener->onDiskFormatOffer(getId(), mVolumes.empty());  // DiamaneOS: stock's rule
         if (listener) listener->onDiskScanned(getId());
 
         mJustPartitioned = false;
@@ -429,6 +432,7 @@ status_t Disk::readPartitions() {
     }
 
     auto listener = VolumeManager::Instance()->getListener();
+    if (listener) listener->onDiskFormatOffer(getId(), mVolumes.empty());  // DiamaneOS: stock's rule
     if (listener) listener->onDiskScanned(getId());
 
     mJustPartitioned = false;
@@ -492,6 +496,7 @@ status_t Disk::partitionPrivate() {
 status_t Disk::partitionMixed(int8_t ratio) {
     int res;
 
+    if (!kNewAdoptableStorage) return RefuseNewAdoption(mId);  // DiamaneOS: model/NewAdoption.h
     DIAMANEOS_FS_IN_VM(if (isVmDisk()) return partitionMixedInVm(ratio);)  // DiamaneOS: no sgdisk (DiskFsvm.cpp)
     destroyAllVolumes();
     mJustPartitioned = true;

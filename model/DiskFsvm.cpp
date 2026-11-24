@@ -238,14 +238,15 @@ bool Disk::createPrivateVolumeInVm(const fsvm::Part& part, int maxMinors) {
         LOG(ERROR) << mId << ": " << volumeId << " is another disk's volume, not setting up its adoptable storage";
         return false;
     }
-    // Adoptable storage: only a card this phone adopted has a key for its partition GUID. Without one, nothing of the
-    // card is set up.
+    // Adoptable storage: only a card this phone adopted has a key for its partition GUID. Without one (another phone's
+    // card, or this phone's key missing or unreadable) nothing of the partition is set up, and the caller makes a
+    // volume that could not be opened in its place: the disk never looks blank, and no format is offered for it.
     std::string normalizedGuid;
     std::string keyRaw;
     if (NormalizeHex(part.partGuid, normalizedGuid) ||
         !ReadFileToString(BuildKeyPath(normalizedGuid), &keyRaw)) {
         LOG(WARNING) << mId << ": no key for the adoptable storage partition " << part.partGuid;
-        return true;
+        return false;
     }
     // dm-crypt sits on a device-mapper range of exactly the partition the VM read, like each public partition's VM.
     // Android's kernel gets no partition of the card, so any number of public partitions can sit next to it (all
@@ -591,8 +592,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     // No medium (an empty slot in a USB card reader): nothing to read, as when sgdisk failed before.
     if (mSize == static_cast<uint64_t>(-1) || mSize < 512) {
         LOG(WARNING) << mId << " has no medium";
-        auto listener = VolumeManager::Instance()->getListener();
-        if (listener) listener->onDiskScanned(getId());
+        sendScanned(false);
         mJustPartitioned = false;
         return OK;
     }
@@ -607,8 +607,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
         createUnopenableVolume();
         mProbeFailed = true;
         ScheduleDeferred(getId(), static_cast<int>((waitMs + 999) / 1000));
-        auto listener = VolumeManager::Instance()->getListener();
-        if (listener) listener->onDiskScanned(getId());
+        sendScanned(false);
         return OK;
     }
 
@@ -626,8 +625,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
         mWaitingForPlace = true;
         createWaitingVolume();
         waitForPlaceDisk(getId());
-        auto listener = VolumeManager::Instance()->getListener();
-        if (listener) listener->onDiskScanned(getId());
+        sendScanned(false);
         mJustPartitioned = false;
         return OK;
     }
@@ -713,11 +711,19 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
         }
     }
 
-    auto listener = VolumeManager::Instance()->getListener();
-    if (listener) listener->onDiskScanned(getId());
+    // A format is offered only for a disk two VMs found blank that has no volume: never for one that could not be
+    // read or whose adoptable storage has no key.
+    sendScanned(fsvm::OffersFormatOnScan(mProbeFailed, layout, !mVolumes.empty()));
 
     mJustPartitioned = false;
     return OK;
+}
+
+void Disk::sendScanned(bool offerFormat) {
+    auto listener = VolumeManager::Instance()->getListener();
+    if (!listener) return;
+    listener->onDiskFormatOffer(getId(), offerFormat);
+    listener->onDiskScanned(getId());
 }
 
 }  // namespace vold

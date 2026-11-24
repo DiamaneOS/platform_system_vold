@@ -110,6 +110,14 @@ uint32_t BlockSize(int fd);
  * second probe, from a new VM, gives the same answer (SameLayout).
  */
 bool OffersFormat(const Layout& l);
+
+/*
+ * Whether a disk's scan lets the framework offer to format the disk (IVoldListener.onDiskFormatOffer): only when the
+ * probe succeeded, its answer offers a format (confirmed by a second VM before) and no volume was made from it. A disk
+ * with adoptable storage never does, whether its key is there or not, whatever else is on it.
+ */
+bool OffersFormatOnScan(bool probeFailed, const Layout& l, bool anyVolume);
+
 /* Whether two probes of a disk gave the same answer, every field of every partition. */
 bool SameLayout(const Layout& a, const Layout& b);
 
@@ -138,8 +146,9 @@ uid_t MediaProviderUid(userid_t user);
  * Serves `v` at `v.target` through FUSE from the filesystem VM. Returns OK once the VM serves it, with fsvmd's pid
  * in `pid`, and in `servedReadOnly` whether the VM served a volume asked for writing read-only (its check did not
  * finish in time, or its driver found an error). On any failure nothing stays mounted: there is no fallback to Android's kernel.
+ * In `checking`, whether it is read-only only while the VM checks it: writable again once the check passes.
  */
-status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly = nullptr);
+status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly = nullptr, bool* checking = nullptr);
 
 /*
  * Stops fsvmd. `orderly`: its FUSE mount is gone, and fsvmd writes the volume back and unmounts it in the VM before

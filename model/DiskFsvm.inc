@@ -46,6 +46,9 @@
     /* Disk::destroy (vold reset, the disk removed): a medium swapped since the last read is cut off before the volumes
      * stop, and the next read makes them again */
     void beforeDestroyInVm();
+    /* Tells the framework the disk was read, and whether it may offer to format it: vold decides that from what the
+     * VM found, never the framework from how many volumes the disk has */
+    void sendScanned(bool offerFormat);
   public:
     enum class Reprobe {
         /* the last probe failed (a protected VM start can be refused for a while after boot) */

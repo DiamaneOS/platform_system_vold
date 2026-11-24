@@ -300,6 +300,8 @@ void PublicVolume::onCheckDone(pid_t serving, char state) {
             announceReadOnly(true);
             break;
     }
+    // The framework's text says whether a check may still make it writable ('c'), or not.
+    announceCheckPending(state == 'c' && !readOnlyForGood());
 }
 
 void PublicVolume::dropMedium() {
@@ -329,7 +331,7 @@ bool PublicVolume::readOnlyForGood() const {
     return mRepairFailed || (mDrive && mDrive->readOnly());
 }
 
-status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly) {
+status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly, bool* checking) {
     // One VM serves every public partition of the drive, each through a range of its own and a disk of its own in the
     // VM, so that no partition's VM reaches another drive and a partition reaches no sector outside its range.
     if (!mDrive || !mDrive->serves(mPart)) {
@@ -340,15 +342,15 @@ status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly) {
     // through /storage closes, which stock's FAT and exFAT drivers let group media_rw do (allow_utime).
     pid_t serving = 0;
     status_t res = mDrive->attach(mPart, gid, fsvm::MediaProviderUid(getMountUserId()), getId(), mRawPath,
-                                  mRepairFailed, &serving, servedReadOnly);
+                                  mRepairFailed, &serving, servedReadOnly, checking);
     if (res != OK) return res;
     mAttached = true;
     mServing = serving;
     return OK;
 }
 
-status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
-    if (mInVm) return serveOnDrive(gid, servedReadOnly);
+status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly, bool* checking) {
+    if (mInVm) return serveOnDrive(gid, servedReadOnly, checking);
     // A volume on a partition device of its own (a virtual disk): a VM of its own sees it as a whole disk.
     fsvm::Volume v;
     // A failed repair keeps it read-only.
@@ -374,7 +376,7 @@ status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
     v.ownerUid = fsvm::MediaProviderUid(getMountUserId());
     v.volumeId = getId();
     v.target = mRawPath;
-    status_t res = fsvm::Mount(std::move(v), &mFsvmdPid, servedReadOnly);
+    status_t res = fsvm::Mount(std::move(v), &mFsvmdPid, servedReadOnly, checking);
     if (res == OK) mServing = mFsvmdPid;
     return res;
 }
@@ -383,8 +385,8 @@ status_t PublicVolume::mountInVm(gid_t gid) {
     mMountStartMs = fsvm::NowMs();
     mWriteBackFailed = false;
     mWaitingForPlace = false;
-    bool servedReadOnly = false;
-    if (status_t res = serveInVm(gid, &servedReadOnly); res != OK) {
+    bool servedReadOnly = false, checking = false;
+    if (status_t res = serveInVm(gid, &servedReadOnly, &checking); res != OK) {
         rmdir(mRawPath.c_str());
         if (res == -EAGAIN) {
             // No room for its VM: the pool and the hypervisor's budget of pieces are taken by the decode service's VM
@@ -403,6 +405,7 @@ status_t PublicVolume::mountInVm(gid_t gid) {
     // check passed (onCheckDone).
     if (servedReadOnly) LOG(WARNING) << getId() << ": served read-only by the filesystem VM";
     setReportReadOnly(servedReadOnly);
+    announceCheckPending(checking);
     return OK;
 }
 

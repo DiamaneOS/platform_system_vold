@@ -34,4 +34,10 @@ oneway interface IVoldListener {
     void onVolumeInternalPathChanged(@utf8InCpp String volId,
             @utf8InCpp String internalPath);
     void onVolumeDestroyed(@utf8InCpp String volId);
+
+    // DiamaneOS: whether the framework may offer to format the disk scanned next. Sent before every onDiskScanned,
+    // so the offer is vold's decision, never inferred from how many volumes the disk has.
+    void onDiskFormatOffer(@utf8InCpp String diskId, boolean offer);
+    // DiamaneOS: a volume served read-only while its filesystem VM checks it. Writing can come back after the check.
+    void onVolumeCheckPending(@utf8InCpp String volId, boolean pending);
 }

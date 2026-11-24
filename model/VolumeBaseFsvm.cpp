@@ -49,6 +49,15 @@ void VolumeBase::announceReadOnly(bool readOnly) {
     setState(State::kMounted);
 }
 
+void VolumeBase::announceCheckPending(bool pending) {
+    const bool changed = mCheckPending != pending;
+    mCheckPending = pending;
+    auto listener = getListener();
+    if (listener) listener->onVolumeCheckPending(getId(), pending);
+    // A volume shown read-only already: its state again, so the framework shows the new text.
+    if (changed && mState == State::kMounted && mReportReadOnly) setState(State::kMounted);
+}
+
 void VolumeBase::setUnopenable() {
     if (mState == State::kUnmounted) setState(State::kUnopenable);
 }

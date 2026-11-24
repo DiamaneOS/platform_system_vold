@@ -17,6 +17,7 @@
 #include <android-base/file.h>
 #include <android-base/unique_fd.h>
 #include <gtest/gtest.h>
+#include <selinux/android.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
@@ -26,6 +27,7 @@
 
 #include "../fs/Fsvm.h"
 #include "../fs/FsvmDrive.h"
+#include "../model/Disk.h"
 #include "../model/PublicVolume.h"
 
 // vold's main.cpp defines it, and CreateRange refers to it through CreateDeviceNode. The tests never get that far.
@@ -168,6 +170,39 @@ TEST(FsvmTest, OnlyTwoEqualAnswersOfferAFormat) {
     EXPECT_TRUE(SameLayout(first, second));
     second.diskBytes = kDisk / 2;
     EXPECT_FALSE(SameLayout(first, second));
+}
+
+TEST(FsvmTest, AdoptableStorageWithoutItsKeyIsNeverOfferedForFormatting) {
+    Layout blank, adopted, mixed, fat;
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 none 0\nEND\n", kDisk, &blank));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 gpt 2\nPART 1 meta 2048 2048 - - 02020202-0202-0202-0202-020202020202 0 -\n"
+                              "PART 2 expand 4096 100000 - - 03030303-0303-0303-0303-030303030303 0 -\nEND\n",
+                              kDisk, &adopted));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 gpt 3\nPART 1 public 2048 4096 - - 01010101-0101-0101-0101-010101010101 0 -\n"
+                              "PART 2 meta 6144 2048 - - 02020202-0202-0202-0202-020202020202 0 -\n"
+                              "PART 3 expand 8192 100000 - - 03030303-0303-0303-0303-030303030303 0 -\nEND\n",
+                              kDisk, &mixed));
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 1\nPART 1 public 2048 4096 vfat - - 0 -\nEND\n", kDisk, &fat));
+    // Only a blank disk without any volume, read by a probe that worked, gets the offer.
+    EXPECT_TRUE(OffersFormatOnScan(false, blank, false));
+    EXPECT_FALSE(OffersFormatOnScan(true, blank, false));
+    EXPECT_FALSE(OffersFormatOnScan(false, blank, true));
+    // An adopted card whose key is missing: its volume could not be made, and still no offer, with or without the
+    // volume that stands in for it.
+    EXPECT_FALSE(OffersFormatOnScan(false, adopted, false));
+    EXPECT_FALSE(OffersFormatOnScan(false, adopted, true));
+    EXPECT_FALSE(OffersFormatOnScan(false, mixed, false));
+    EXPECT_FALSE(OffersFormatOnScan(false, fat, false));
+}
+
+TEST(FsvmTest, NewAdoptableStorageIsRefusedBeforeAnythingIsWritten) {
+    // No such device: whatever got past the refusal would fail on it, with another error than EPERM. A Disk makes its
+    // device node, labelled as vold's main does.
+    if (!sehandle) sehandle = selinux_android_file_context_handle();
+    ASSERT_NE(nullptr, sehandle);
+    Disk disk("/devices/virtual/block/fsvm-test-none", makedev(179, 1048575), "test", Disk::Flags::kAdoptable);
+    EXPECT_EQ(-EPERM, disk.partitionPrivate());
+    EXPECT_EQ(-EPERM, disk.partitionMixed(50));
 }
 
 TEST(FsvmTest, MediumBinding) {
