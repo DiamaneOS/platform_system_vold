@@ -26,6 +26,7 @@
 
 #include "../fs/Fsvm.h"
 #include "../fs/FsvmDrive.h"
+#include "../model/PublicVolume.h"
 
 // vold's main.cpp defines it, and CreateRange refers to it through CreateDeviceNode. The tests never get that far.
 struct selabel_handle* sehandle;
@@ -408,7 +409,8 @@ TEST(FsvmTest, DriveServesOnlyItsParts) {
     moved.length++;
     EXPECT_FALSE(d.serves(moved));
     pid_t serving = 0;
-    EXPECT_EQ(-EIO, d.attach(DrivePart(3, "vfat", 0), 1023, 0, "public:4095,3", "/nonexistent", &serving, nullptr));
+    EXPECT_EQ(-EIO,
+              d.attach(DrivePart(3, "vfat", 0), 1023, 0, "public:4095,3", "/nonexistent", false, &serving, nullptr));
     EXPECT_EQ(0, serving);
     EXPECT_EQ(0, d.detach(DrivePart(1, "vfat", 0), true));
     EXPECT_EQ(-1, d.startRepair(DrivePart(1, "vfat", 0)));
@@ -490,6 +492,39 @@ TEST(FsvmTest, AdmissionSizesAsFsvmd) {
     EXPECT_EQ(145u, RepairVmMib("exfat", 65 << 20));
     EXPECT_EQ(256u, RepairVmMib("exfat", UINT64_MAX));
     EXPECT_EQ(224u, RepairVmMib("vfat", UINT64_MAX));
+}
+
+// H4: a partition's ID and node come only from the disk's own minors, and a node left for another device goes.
+TEST(FsvmTest, PartitionIdsStayOnTheirDisk) {
+    dev_t d = 0;
+    EXPECT_TRUE(PartitionDevice(makedev(8, 96), 15, 15, &d));
+    EXPECT_EQ(makedev(8, 111), d);
+    EXPECT_FALSE(PartitionDevice(makedev(8, 96), 16, 15, &d));
+    EXPECT_FALSE(PartitionDevice(makedev(8, 96), 20, 15, &d));
+    EXPECT_FALSE(PartitionDevice(makedev(8, 96), 0, 15, &d));
+    EXPECT_FALSE(PartitionDevice(makedev(179, 0), 1, 0, &d));
+    EXPECT_FALSE(PartitionDevice(makedev(8, 0xFFFFF), 1, 15, &d));
+    TemporaryDir dir;
+    const std::string node = std::string(dir.path) + "/private:8,97";
+    EXPECT_EQ(OK, ClaimNode(node, makedev(8, 97)));
+    ASSERT_TRUE(android::base::WriteStringToFile("x", node));
+    EXPECT_EQ(OK, ClaimNode(node, makedev(8, 97)));
+    EXPECT_NE(0, access(node.c_str(), F_OK));
+}
+
+// H2: vold never mounts an app-visible volume itself: without the framework's callback MediaProvider would never get
+// its FUSE session. Such a mount is refused before any mount point is made, and the volume is not opened (no format
+// offer).
+TEST(FsvmTest, NoVisibleMountWithoutTheFrameworkCallback) {
+    Part p = DrivePart(1, "vfat", 0);
+    p.fsUuid = "1B2C-3D4E";
+    PublicVolume vol(makedev(4095, 1048575), "/dev/block/vold/disk:4095,1048575", "/sys/nonexistent", 64ULL << 30, p,
+                     nullptr);
+    vol.setSilent(true);
+    ASSERT_EQ(OK, vol.setMountFlags(VolumeBase::MountFlags::kVisibleForWrite));
+    EXPECT_NE(OK, vol.mount());
+    EXPECT_EQ(VolumeBase::State::kUnopenable, vol.getState());
+    EXPECT_TRUE(vol.getInternalPath().empty()) << vol.getInternalPath();
 }
 
 }  // namespace fsvm

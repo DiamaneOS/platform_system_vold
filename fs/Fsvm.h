@@ -23,8 +23,11 @@
 #include <sys/types.h>
 #include <utils/Errors.h>
 
+#include "FsvmTable.h"
+
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -155,8 +158,6 @@ void RequestStop(pid_t pid);
 /* Kills fsvmd at once, with no write back (its volume's medium is gone), and reaps it. */
 void Kill(pid_t pid);
 
-/* fsvmd's exit status when a repair did not leave the volume clean (fsvmd main.rs EXIT_NOT_REPAIRED) */
-static constexpr int kExitNotRepaired = 4;
 /* fsvmd's exit status when its VM was refused at its start for want of memory: no pool room and the pieces left of
  * the hypervisor's budget too few (fsvmd main.rs EXIT_NO_ROOM) */
 static constexpr int kExitNoRoom = 5;
@@ -167,6 +168,9 @@ static constexpr int kExitNoRoom = 5;
 pid_t StartRepair(Volume&& v);
 /* Waits for repair `pid` to end, without a time limit: never with vold's lock held. 0 when the volume is clean now. */
 int WaitRepair(pid_t pid);
+
+/* Milliseconds of CLOCK_BOOTTIME. */
+int64_t NowMs();
 
 /* Asks fsvmd to write its volume back and end, with the full time for it, without waiting: several volumes of a disk
  * that goes write back together, and each Stop then finds its fsvmd done. */
@@ -195,6 +199,8 @@ class ProbeMemory {
     bool took(const std::string& seq, uint64_t size, int64_t nowMs);
     /* Whether the last read saw this medium, true before any read. */
     bool holds(const std::string& seq, uint64_t size) const;
+    /* The medium sequence the last read saw, empty before any read: what an erase must find (IsMedium). */
+    std::string mediumRead() const { return mProbed ? mSeq : std::string(); }
     /* The disk's volumes went without a new medium (vold reset): the next read makes them again. */
     void forget() { mProbed = false; }
 
@@ -212,7 +218,6 @@ class ProbeMemory {
  * VM the kernel or the hypervisor refused at its start (kExitNoRoom).
  */
 void SetPlaceHooks(std::function<bool()> stopObbForDrive, std::function<void()> onPlaceFree);
-size_t PlacesInUse();
 /* Whether a drive waits for room: an OBB image's VM does not start meanwhile. */
 void SetDrivesWaiting(bool waiting);
 /* Whether a VM of `mib` MiB would find room now, read from the pool and the piece count. */
@@ -224,9 +229,8 @@ static constexpr uint64_t kServeVmMib = 96;
 uint64_t ObbVmMib(uint64_t diskBytes);
 uint64_t RepairVmMib(const std::string& fsType, uint64_t metaBytes);
 
-/* Counts a serving fsvmd that ended (Mount counts the ones that start). */
-
-void Served(bool obb, bool starting);
+/* Counts a serving fsvmd that starts or ends (Mount counts its own). */
+void Served(bool starting);
 
 /*
  * Stops fsvmd `pid` (a stop, then a kill 2 s later) unless it is cancelled within `ms`: the steps of a mount after the
@@ -274,8 +278,31 @@ status_t DeletePartition(const std::string& diskPath, uint32_t index);
  */
 status_t DeleteAllPartitions(const std::string& diskPath, const std::string& diskSysPath);
 
-/* Zeroes the first and last MiB of a disk, where MBR and GPT tables live, before new ones are written. */
-status_t ZeroTables(const std::string& diskPath, uint64_t diskBytes);
+/*
+ * The device a partition's volume ID and node are named after (Android's kernel numbered it so): the disk's minor
+ * plus partition `index`, only for 1 to `maxMinors` (Disk::getMaxMinors).
+ */
+bool PartitionDevice(dev_t disk, uint32_t index, int maxMinors, dev_t* out);
+/* Makes room for vold's node `path` of device `dev`: kept when it is that device's, removed when it was left for
+ * another (a vold that ended with other volumes), so that it is never used for the wrong device. */
+status_t ClaimNode(const std::string& path, dev_t dev);
+
+/*
+ * Before anything that erases (a new table, a format): whether `disk` holds the medium `seq` now. Unlike SameMedium,
+ * an unknown sequence (none recorded, or none readable now) is never a match.
+ */
+bool IsMedium(dev_t disk, const std::string& seq);
+/* Whether `disk` is `bytes` long now, as the kernel counts it. */
+bool HasSize(dev_t disk, uint64_t bytes);
+/*
+ * Opens the disk at `path` to write a new partition table (FsvmTable.h), only while it is still the disk `disk` of
+ * `bytes` bytes holding medium `seq`, checked before and after the open: the returned descriptor is the one
+ * everything is written through, with the disk's logical block size. -ENODEV otherwise.
+ */
+status_t OpenToErase(const std::string& path, dev_t disk, uint64_t bytes, const std::string& seq,
+                     android::base::unique_fd* fd, uint32_t* blockSize);
+/* Writes table `t` through `fd` (OpenToErase): the disk's last MiB, then its first, then a flush. Reads nothing. */
+status_t WriteTable(int fd, const Table& t);
 
 }  // namespace fsvm
 }  // namespace vold

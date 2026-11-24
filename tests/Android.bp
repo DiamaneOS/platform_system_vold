@@ -8,15 +8,22 @@ cc_test {
     defaults: [
         "vold_default_flags",
         "vold_default_libs",
+        "keystore2_use_latest_aidl_ndk_shared", // DiamaneOS: PublicVolume's code in libvold, as the fuzzer links it
     ],
 
     srcs: [
         "Fsvm_test.cpp", // DiamaneOS: the filesystem VM's parser and checks
+        "FsvmTable_test.cpp", // DiamaneOS: the partition tables vold writes itself
         "Utils_test.cpp",
         "VoldNativeServiceValidation_test.cpp",
     ],
-    static_libs: ["libvold"],
+    static_libs: [
+        "libvold",
+        "android.security.maintenance-ndk", // DiamaneOS: with keystore2's, as vold_native_service_fuzzer
+        "libkeymint_support",
+    ],
     shared_libs: ["libbinder"],
+    header_libs: ["libvold_headers"], // DiamaneOS: Fsvm_test.cpp uses model/PublicVolume.h
 }
 
 cc_fuzz {
@@ -82,5 +89,22 @@ cc_test_host {
     srcs: ["FsvmLayoutReplay.cpp"],
     cflags: ["-DFSVM_LAYOUT_REPLAY"],
     data: ["fsvm_layout_corpus/*"],
+    test_suites: ["general-tests"],
+}
+
+// DiamaneOS: the partition tables vold writes on a card or USB drive the filesystem VM serves (fs/FsvmTable.cpp),
+// byte for byte against what sgdisk wrote for the same requests on scratch image files (FsvmTableRef.inc, from
+// fsvm_table_ref.py), on the host.
+cc_test_host {
+    name: "vold_fsvm_table_test",
+    srcs: [
+        "FsvmTable_test.cpp",
+        ":vold_fsvm_table_src",
+    ],
+    header_libs: ["libutils_headers"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
     test_suites: ["general-tests"],
 }

@@ -452,7 +452,7 @@ status_t Disk::unmountAll() {
 status_t Disk::partitionPublic() {
     int res;
 
-    DIAMANEOS_FS_IN_VM(if (status_t r = beforePartitionInVm(); r != OK) return r;)  // DiamaneOS: DiskFsvm.cpp
+    DIAMANEOS_FS_IN_VM(if (isVmDisk()) return partitionPublicInVm();)  // DiamaneOS: no sgdisk (DiskFsvm.cpp)
     destroyAllVolumes();
     mJustPartitioned = true;
 
@@ -482,7 +482,6 @@ status_t Disk::partitionPublic() {
         return res;
     }
 
-    DIAMANEOS_FS_IN_VM(if (isVmDisk()) return readPartitions();)  // DiamaneOS: the VM reads the new table
     return OK;
 }
 
@@ -493,7 +492,7 @@ status_t Disk::partitionPrivate() {
 status_t Disk::partitionMixed(int8_t ratio) {
     int res;
 
-    DIAMANEOS_FS_IN_VM(if (status_t r = beforePartitionInVm(); r != OK) return r;)  // DiamaneOS: DiskFsvm.cpp
+    DIAMANEOS_FS_IN_VM(if (isVmDisk()) return partitionMixedInVm(ratio);)  // DiamaneOS: no sgdisk (DiskFsvm.cpp)
     destroyAllVolumes();
     mJustPartitioned = true;
 
@@ -573,7 +572,6 @@ status_t Disk::partitionMixed(int8_t ratio) {
         return res;
     }
 
-    DIAMANEOS_FS_IN_VM(if (isVmDisk()) return readPartitions();)  // DiamaneOS: the VM reads the new table
     return OK;
 }
 

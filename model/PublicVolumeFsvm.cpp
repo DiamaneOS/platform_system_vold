@@ -33,7 +33,6 @@
 #include <android-base/unique_fd.h>
 #include <android-base/stringprintf.h>
 #include <private/android_filesystem_config.h>
-#include <utils/Timers.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -95,7 +94,7 @@ pid_t PublicVolume::startRepairInVm(pid_t serving) {
         mRepairPid = mDrive->startRepair(mPart);
         if (mRepairPid == -1) {
             mDrive->repairEnded();
-            showUnmounted();
+            remakeAfterRepair(true);
         }
         return mRepairPid;
     }
@@ -107,7 +106,7 @@ pid_t PublicVolume::startRepairInVm(pid_t serving) {
     v.blockSize = v.fd >= 0 ? fsvm::BlockSize(v.fd.get()) : 0;
     if (v.fd < 0 || !v.blockSize || GetBlockDevSize(v.fd.get(), &v.diskBytes) != OK || v.diskBytes < 512) {
         LOG(ERROR) << getId() << ": no disk for the repair";
-        showUnmounted();
+        remakeAfterRepair(true);
         return -1;
     }
     v.diskBytes &= ~511ULL;
@@ -118,7 +117,8 @@ pid_t PublicVolume::startRepairInVm(pid_t serving) {
     mRepairPid = fsvm::StartRepair(std::move(v));
     if (mRepairPid <= 0) {
         mRepairPid = -1;
-        showUnmounted();
+        remakeAfterRepair(true);
+        return -1;
     }
     return mRepairPid;
 }
@@ -129,14 +129,27 @@ void PublicVolume::endRepairInVm(pid_t repairPid, int rc) {
     mRepairPid = -1;
     if (rc != 0) {
         LOG(ERROR) << getId() << ": the repair in the filesystem VM failed (" << rc << "), it stays read-only";
-        mRepairFailed = true;
     } else {
-        LOG(INFO) << getId() << ": repaired in the filesystem VM, mounting it again";
+        LOG(INFO) << getId() << ": repaired in the filesystem VM, made again for the framework to mount";
     }
+    auto drive = mDrive;
+    remakeAfterRepair(rc != 0);
+    // The volume is made again (this one is gone): the drive's VM may end until the framework mounts it.
+    if (drive) drive->repairEnded();
+}
+
+void PublicVolume::remakeAfterRepair(bool failed) {
+    // Never mounted by vold itself: only the framework's mount hands MediaProvider the new FUSE session (its
+    // callback). The volume is made again for the framework to mount, as at insertion. A failed repair, or one that
+    // could not start, keeps it read-only from then on, explicitly. Without its disk it stays unmounted, and says so.
     showUnmounted();
-    mount();
-    // After the mount, so that the drive's VM serves on when the partition is served again.
-    if (mDrive) mDrive->repairEnded();
+    auto disk = VolumeManager::Instance()->findDisk(getDiskId());
+    if (!disk) {
+        LOG(ERROR) << getId() << ": no disk to make the volume again after its repair";
+        setUnopenable();
+        return;
+    }
+    disk->remakePublicVolume(getId(), failed);
 }
 
 bool PublicVolume::cancelRepairInVm() {
@@ -182,6 +195,13 @@ status_t PublicVolume::checkInVm() {
         }
         if (mPart.unread) {
             LOG(ERROR) << getId() << ": the filesystem VM could not read this disk";
+            mVmFailed = true;
+            return -EIO;
+        }
+        if (isVisibleForWrite() && !getMountCallback()) {
+            // Apps reach the volume only through MediaProvider's FUSE session, which the framework's mount callback
+            // hands over: a mount without one would serve nobody. Only the framework mounts it.
+            LOG(ERROR) << getId() << ": no framework mount callback for its FUSE session, not mounting it";
             mVmFailed = true;
             return -EIO;
         }
@@ -237,6 +257,10 @@ void PublicVolume::onCheckDone(pid_t serving, char state) {
     // The volume was reported read-only while the VM checked it (Mount, c): writable once the check passed.
     switch (state) {
         case 'W':
+            if (readOnlyForGood()) {
+                LOG(WARNING) << getId() << ": checked in the filesystem VM, it stays read-only as it was mounted";
+                break;
+            }
             LOG(INFO) << getId() << ": checked in the filesystem VM, writable now";
             announceReadOnly(false);
             break;
@@ -290,10 +314,19 @@ void PublicVolume::dropMedium() {
     if (mFsvmdPid <= 0) return;
     LOG(WARNING) << getId() << ": the medium changed, its VM stops without writing back";
     fsvm::Kill(mFsvmdPid);
-    fsvm::Served(false, false);
+    fsvm::Served(false);
     mFsvmdPid = -1;
     mServing = 0;
     mWriteBackFailed = true;
+}
+
+void PublicVolume::noteNotWrittenBack() {
+    auto disk = VolumeManager::Instance()->findDisk(getDiskId());
+    if (disk) disk->noteNotWrittenBack(getId());
+}
+
+bool PublicVolume::readOnlyForGood() const {
+    return mRepairFailed || (mDrive && mDrive->readOnly());
 }
 
 status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly) {
@@ -306,8 +339,8 @@ status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly) {
     // MediaProvider of the user the volume is mounted for owns its files: it sets their times when an app's write
     // through /storage closes, which stock's FAT and exFAT drivers let group media_rw do (allow_utime).
     pid_t serving = 0;
-    status_t res = mDrive->attach(mPart, gid, fsvm::MediaProviderUid(getMountUserId()), getId(), mRawPath, &serving,
-                                  servedReadOnly);
+    status_t res = mDrive->attach(mPart, gid, fsvm::MediaProviderUid(getMountUserId()), getId(), mRawPath,
+                                  mRepairFailed, &serving, servedReadOnly);
     if (res != OK) return res;
     mAttached = true;
     mServing = serving;
@@ -318,8 +351,10 @@ status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
     if (mInVm) return serveOnDrive(gid, servedReadOnly);
     // A volume on a partition device of its own (a virtual disk): a VM of its own sees it as a whole disk.
     fsvm::Volume v;
-    v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), O_RDWR | O_CLOEXEC)));
-    if (v.fd < 0 && (errno == EROFS || errno == EACCES)) {
+    // A failed repair keeps it read-only.
+    v.readOnly = mRepairFailed;
+    v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), (v.readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC)));
+    if (v.fd < 0 && !v.readOnly && (errno == EROFS || errno == EACCES)) {
         v.readOnly = true;
         v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), O_RDONLY | O_CLOEXEC)));
     }
@@ -345,7 +380,7 @@ status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
 }
 
 status_t PublicVolume::mountInVm(gid_t gid) {
-    mMountStartMs = systemTime(SYSTEM_TIME_BOOTTIME) / 1000000;
+    mMountStartMs = fsvm::NowMs();
     mWriteBackFailed = false;
     mWaitingForPlace = false;
     bool servedReadOnly = false;
@@ -374,7 +409,7 @@ status_t PublicVolume::mountInVm(gid_t gid) {
 int PublicVolume::guardMs() const {
     // The steps after the VM served the volume (MediaProvider's FUSE, which may have to start first after boot) get
     // whatever the VM left of 52 s, at least 15 s: a quick VM mount leaves them more. vold holds its lock throughout.
-    int64_t spent = systemTime(SYSTEM_TIME_BOOTTIME) / 1000000 - mMountStartMs;
+    int64_t spent = fsvm::NowMs() - mMountStartMs;
     return static_cast<int>(std::max<int64_t>(15000, 52000 - spent));
 }
 
@@ -387,6 +422,7 @@ void PublicVolume::stopInVm() {
             if (rc != 0) {
                 LOG(ERROR) << getId() << ": not everything may have been written back (" << rc << ")";
                 mWriteBackFailed = true;
+                noteNotWrittenBack();
             }
         }
         mAttached = false;
@@ -400,8 +436,9 @@ void PublicVolume::stopInVm() {
         if (rc != 0) {
             LOG(ERROR) << getId() << ": not everything may have been written back (" << rc << ")";
             mWriteBackFailed = true;
+            noteNotWrittenBack();
         }
-        fsvm::Served(false, false);
+        fsvm::Served(false);
     }
     mFsvmdPid = -1;
     mServing = 0;
@@ -413,19 +450,11 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
         return -EIO;
     }
     // Both are formatted in the VM, whatever mkfs tools Android has.
-    bool isVfatSup = true;
-    bool isExfatSup = true;
     std::string pick;
     if (fsType == "auto") {
-        // As for kernel mounted cards: exFAT for SDXC (>~32GiB) cards when both are supported.
-        if (isVfatSup && isExfatSup) {
-            pick = mPart.length * 512 > 32896ULL * 1024 * 1024 ? "exfat" : "vfat";
-        } else if (isExfatSup) {
-            pick = "exfat";
-        } else if (isVfatSup) {
-            pick = "vfat";
-        }
-    } else if ((fsType == "vfat" && isVfatSup) || (fsType == "exfat" && isExfatSup)) {
+        // As for kernel mounted cards: exFAT for SDXC (>~32GiB) cards.
+        pick = mPart.length * 512 > 32896ULL * 1024 * 1024 ? "exfat" : "vfat";
+    } else if (fsType == "vfat" || fsType == "exfat") {
         pick = fsType;
     }
     if (pick.empty()) {
@@ -436,15 +465,21 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
         LOG(ERROR) << getId() << ": no drive's VM to format it in";
         return -EIO;
     }
+    // Its last writes did not reach the medium, also when it shows as unopenable since: it may hold what the user
+    // wants back. Retry and browse stay, an erase does not come from here.
+    auto disk = VolumeManager::Instance()->findDisk(getDiskId());
+    if (disk && disk->notWrittenBack(getId())) {
+        LOG(ERROR) << getId() << ": not written back, not formatting it";
+        return -EBUSY;
+    }
     // In the drive's VM, as everything else that touches the volume's filesystem: no mkfs runs on Android. The new
     // filesystem has a new serial, so the UUID changes: the VM reads it, as blkid did at mount.
     fsvm::Part formatted;
     bool recheck = false;
     status_t res = mDrive->format(mPart, pick, &formatted, &recheck);
-    if (recheck) {
+    if (recheck && disk) {
         // Formatted without a read back, or perhaps formatted: a new probe shows what the medium holds now.
-        auto disk = VolumeManager::Instance()->findDisk(getDiskId());
-        if (disk) disk->recheckAfterFormat();
+        disk->recheckAfterFormat();
     }
     if (res != OK) {
         LOG(ERROR) << getId() << " failed to format" << (recheck ? ", perhaps in part: the disk is read again" : "");
@@ -465,7 +500,7 @@ void PublicVolume::onMountFailed() {
 void PublicVolume::doPostMount() {
     if (!mInVm) return;
     auto disk = VolumeManager::Instance()->findDisk(getDiskId());
-    if (disk) disk->noteMounted();
+    if (disk) disk->noteMounted(getId());
 }
 
 void PublicVolume::prepareStop() {

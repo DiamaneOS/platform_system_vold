@@ -34,6 +34,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
@@ -131,7 +132,7 @@ int64_t NowMs() {
 }
 
 /*
- * fsvmd runs through init's fsvmd service (vendor/diamaneos fsvm/fsvmd/fsvmd.rc), as the system user without
+ * fsvmd runs through init's fsvmd service (vendor/diamaneos fsvm/fsvmd/fsvmd.rc), as its slot's own user without
  * capabilities: vold holds neither setuid nor setgid, and changes no ids. Each fsvmd has one connection to the
  * service, kept here by its pid. The service passes on a stop (T) or kill (K), kills fsvmd when vold closes the
  * connection, and closes it after it reported how fsvmd ended (X <status>). See fsvmd/src/launcher.rs.
@@ -710,8 +711,9 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
         LOG(WARNING) << "fsvm: " << kMaxServing << " volumes are served already, " << v.volumeId << " waits";
         return -EAGAIN;
     }
+    // A volume asked read-only is read-only for good: the kernel's FUSE mount refuses writes itself.
     unique_fd fuse;
-    if (status_t res = MountFuse(v.target, v.gid, v.obb, &fuse); res != OK) return res;
+    if (status_t res = MountFuse(v.target, v.gid, v.obb || v.readOnly, &fuse); res != OK) return res;
     int p[2];
     if (pipe2(p, O_CLOEXEC)) {
         int e = errno;
@@ -752,7 +754,7 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
         // r: asked for writing, served read-only by the VM. c: marked dirty, read-only while the VM checks it, then
         // W or F on the same pipe (fsvmd main.rs). Both are reported read-only: apps would get EROFS from a volume
         // reported writable.
-        if (servedReadOnly) *servedReadOnly = c == 'r' || c == 'c';
+        if (servedReadOnly) *servedReadOnly = v.readOnly || c == 'r' || c == 'c';
         LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child
                   << (c == 'c' ? ", read-only while the VM checks it" : "");
         *pid = child;
@@ -819,7 +821,7 @@ pid_t StartRepair(Volume&& v) {
         LOG(ERROR) << "fsvm: no fsvmd for the repair of " << v.volumeId;
         return -1;
     }
-    Served(false, true);
+    Served(true);
     std::lock_guard<std::mutex> lock(sChildrenLock);
     sRepairPipes[pid] = std::move(rd);
     LOG(INFO) << "fsvm: repairing " << v.volumeId << " in the filesystem VM, fsvmd pid " << pid;
@@ -844,7 +846,7 @@ int WaitRepair(pid_t pid) {
     std::string text;
     if (rd >= 0) ReadAll(rd.get(), NowMs() + 1000, 16, &text);
     Forget(pid);
-    Served(false, false);
+    Served(false);
     if (!ended) return -1;
     if (value == 0 && text == "OK\n") return 0;
     return value == 0 ? -1 : static_cast<int>(value);
@@ -922,13 +924,7 @@ bool RoomForVm(uint64_t mib) {
     return RoomFor(mib, &why);
 }
 
-size_t PlacesInUse() {
-    std::lock_guard<std::mutex> lock(sChildrenLock);
-    return sBusySlots.size();
-}
-
-void Served(bool obb, bool starting) {
-    if (obb) return;
+void Served(bool starting) {
     if (starting) {
         sServing++;
     } else if (sServing > 0) {
@@ -1174,21 +1170,93 @@ status_t DeletePartition(const std::string& diskPath, uint32_t index) {
     return res;
 }
 
-status_t ZeroTables(const std::string& diskPath, uint64_t diskBytes) {
+bool PartitionDevice(dev_t disk, uint32_t index, int maxMinors, dev_t* out) {
+    // Linux numbers minors in 20 bits.
+    if (index == 0 || maxMinors <= 0 || index > static_cast<uint32_t>(maxMinors) ||
+        minor(disk) + static_cast<uint64_t>(index) > 0xFFFFF) {
+        return false;
+    }
+    *out = makedev(major(disk), minor(disk) + index);
+    return true;
+}
+
+status_t ClaimNode(const std::string& path, dev_t dev) {
+    struct stat st;
+    if (lstat(path.c_str(), &st)) return errno == ENOENT ? OK : -errno;
+    if (S_ISBLK(st.st_mode) && st.st_rdev == dev) return OK;
+    LOG(WARNING) << "fsvm: " << path << " was left for another device, it goes";
+    return unlink(path.c_str()) && errno != ENOENT ? -errno : OK;
+}
+
+bool IsMedium(dev_t disk, const std::string& seq) {
+    if (android::base::Trim(seq).empty()) return false;
+    std::string now;
+    if (!android::base::ReadFileToString(StringPrintf("/sys/dev/block/%u:%u/diskseq", major(disk), minor(disk)),
+                                         &now)) {
+        return false;
+    }
+    now = android::base::Trim(now);
+    return !now.empty() && now == android::base::Trim(seq);
+}
+
+bool HasSize(dev_t disk, uint64_t bytes) {
+    uint64_t sectors = 0;
+    return ReadNumber(StringPrintf("/sys/dev/block/%u:%u/size", major(disk), minor(disk)), &sectors) &&
+           sectors <= UINT64_MAX / 512 && sectors * 512 == bytes;
+}
+
+status_t OpenToErase(const std::string& path, dev_t disk, uint64_t bytes, const std::string& seq, unique_fd* fd,
+                     uint32_t* blockSize) {
+    fd->reset();
+    *blockSize = 0;
+    // The identity first: nothing is opened for writing on a medium other than the one the user chose.
+    if (!IsMedium(disk, seq)) {
+        LOG(ERROR) << "fsvm: " << path << " does not hold the medium it was read from, not erasing it";
+        return -ENODEV;
+    }
+    // O_DIRECT: whole blocks go to the medium as they are, and the kernel reads nothing from it for them.
+    unique_fd f(TEMP_FAILURE_RETRY(open(path.c_str(), O_WRONLY | O_DIRECT | O_CLOEXEC)));
+    if (f < 0) {
+        PLOG(ERROR) << "fsvm: opening " << path << " to write its table";
+        return -EIO;
+    }
+    struct stat st;
+    uint64_t size = 0;
+    const uint32_t bs = BlockSize(f.get());
+    if (fstat(f.get(), &st) || !S_ISBLK(st.st_mode) || st.st_rdev != disk || !bs ||
+        GetBlockDevSize(f.get(), &size) != OK || size != bytes) {
+        LOG(ERROR) << "fsvm: " << path << " is not the disk of " << bytes << " bytes it was read as, not erasing it";
+        return -ENODEV;
+    }
+    // Opened while it still held that medium: everything that follows goes through this descriptor.
+    if (!IsMedium(disk, seq)) {
+        LOG(ERROR) << "fsvm: the medium of " << path << " changed while it was opened, not erasing it";
+        return -ENODEV;
+    }
+    *fd = std::move(f);
+    *blockSize = bs;
+    return OK;
+}
+
+status_t WriteTable(int fd, const Table& t) {
+    // The end first, then the start, as sgdisk writes a GPT (UEFI's order), each a MiB of zeros with the table's
+    // sectors: the old tables go with them. O_DIRECT wants aligned memory.
     static constexpr size_t kMiB = 1 << 20;
-    unique_fd fd(TEMP_FAILURE_RETRY(open(diskPath.c_str(), O_WRONLY | O_CLOEXEC)));
-    if (fd < 0) return -errno;
-    std::vector<char> zero(kMiB, 0);
-    uint64_t ends[2] = {0, diskBytes >= 2 * kMiB ? diskBytes - kMiB : 0};
-    for (uint64_t at : ends) {
+    void* mem = nullptr;
+    if (t.head.size() != kMiB || t.tail.size() != kMiB || posix_memalign(&mem, 4096, kMiB)) return -EINVAL;
+    std::unique_ptr<void, decltype(&free)> buf(mem, free);
+    const std::pair<const std::vector<uint8_t>*, uint64_t> parts[] = {{&t.tail, t.tailOffset}, {&t.head, 0}};
+    for (const auto& [bytes, at] : parts) {
+        memcpy(buf.get(), bytes->data(), kMiB);
         size_t done = 0;
         while (done < kMiB) {
-            ssize_t n = TEMP_FAILURE_RETRY(pwrite(fd.get(), zero.data() + done, kMiB - done, at + done));
+            ssize_t n = TEMP_FAILURE_RETRY(
+                    pwrite(fd, static_cast<char*>(buf.get()) + done, kMiB - done, at + done));
             if (n <= 0) return n < 0 ? -errno : -EIO;
             done += n;
         }
     }
-    return fsync(fd.get()) ? -errno : OK;
+    return fsync(fd) ? -errno : OK;
 }
 
 }  // namespace fsvm
