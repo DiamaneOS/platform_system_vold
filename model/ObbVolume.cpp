@@ -15,6 +15,7 @@
  */
 
 #include "ObbVolume.h"
+#include <chrono>
 #include "Loop.h"
 #include "Utils.h"
 #include "VoldUtil.h"
@@ -41,7 +42,9 @@ namespace vold {
 
 ObbVolume::ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid, userid_t user)
     : VolumeBase(Type::kObb) {
-    setId(StringPrintf("obb:%d", id));
+    // DiamaneOS: native IDs remain distinct across vold service epochs.
+    static const auto epoch = std::chrono::steady_clock::now().time_since_epoch().count();
+    setId(StringPrintf("obb:%lld:%d", static_cast<long long>(epoch), id));
     mSourcePath = sourcePath;
     mOwnerGid = ownerGid;
     mUser = user;  // DiamaneOS
@@ -87,6 +90,7 @@ status_t ObbVolume::doMount() {
 }
 
 status_t ObbVolume::doUnmount() {
+    DIAMANEOS_FS_IN_VM(return cleanupInVm();)  // DiamaneOS: confirmation includes the lower mount
     auto path = getPath();
 
     KillProcessesUsingPath(path);

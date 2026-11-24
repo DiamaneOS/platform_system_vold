@@ -19,6 +19,7 @@
  * inside the class at its end, which it leaves private. Defined in ObbVolumeFsvm.cpp.
  */
   public:
+    status_t cleanupInVm();
     void onFsvmdExit(pid_t pid) override;
     /* The OBB file vold opens (below /data/media, or below a public volume's /mnt/media_rw/<uuid>) */
     const std::string& getSourcePath() const { return mSourcePath; }

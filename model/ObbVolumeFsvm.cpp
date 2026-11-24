@@ -22,6 +22,9 @@
 #include "ObbVolume.h"
 #include "VolumeManager.h"
 #include "fs/Fsvm.h"
+#include "fs/ObbPendingEnd.h"
+#include <thread>
+#include <chrono>
 #include "model/PublicVolume.h"
 
 #include <android-base/logging.h>
@@ -149,8 +152,17 @@ static std::vector<ObbVolume*> sObbInVm;
  * drops its record and tells the app. A later destroyObb of the same ID finds nothing and does nothing. The ID is
  * taken by value: destroyObb frees the volume.
  */
+static fsvm::ObbPendingEnd& sPendingEnds = *new fsvm::ObbPendingEnd;
 static void EndObb(std::string id) {
-    VolumeManager::Instance()->destroyObb(id);
+    sPendingEnds.end(id, [](const std::string& target) {
+        return VolumeManager::Instance()->destroyObb(target) == OK;
+    }, [](std::function<void()> work) {
+        std::thread([work = std::move(work)] {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
+            work();
+        }).detach();
+    });
 }
 
 bool ObbVolume::stopOneForDrive() {
@@ -228,6 +240,14 @@ status_t ObbVolume::mountInVm() {
     sObbVmsByOwner[mOwnerGid]++;
     sObbVmsByUser[user]++;
     return OK;
+}
+
+status_t ObbVolume::cleanupInVm() {
+    const std::string path = getPath();
+    status_t res = path.empty() ? OK : ForceUnmount(path);
+    stopInVm();
+    if (res == OK && !path.empty()) rmdir(path.c_str());
+    return res;
 }
 
 void ObbVolume::stopInVm() {
