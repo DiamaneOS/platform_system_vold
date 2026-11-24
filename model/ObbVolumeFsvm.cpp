@@ -144,10 +144,37 @@ void ObbVolume::requestStop() {
     if (mFsvmdPid > 0) fsvm::RequestStop(mFsvmdPid);
 }
 
+/* The OBB images an fsvmd serves now, in the order they were mounted. With vold's lock held. */
+static std::vector<ObbVolume*> sObbInVm;
+
+/*
+ * An OBB whose VM ended without the framework asking for it (a drive took its place, its fsvmd ended, its card goes)
+ * is destroyed right after its unmount: the framework gets onVolumeDestroyed, the one terminal event of the volume,
+ * drops its record and tells the app. A later destroyObb of the same ID finds nothing and does nothing. The ID is
+ * taken by value: destroyObb frees the volume.
+ */
+static void EndObb(std::string id) {
+    VolumeManager::Instance()->destroyObb(id);
+}
+
+bool ObbVolume::stopOneForDrive() {
+    for (auto it = sObbInVm.rbegin(); it != sObbInVm.rend(); ++it) {
+        ObbVolume* vol = *it;
+        if (vol->getState() != State::kMounted) continue;
+        LOG(WARNING) << vol->getId() << ": its VM stops, a drive needs the protected VM place (OBB images come "
+                     << "last), the app's OBB mount ends";
+        vol->unmount();
+        EndObb(vol->getId());
+        return true;
+    }
+    return false;
+}
+
 void ObbVolume::onFsvmdExit(pid_t pid) {
     if (pid == mFsvmdPid && getState() == State::kMounted) {
         LOG(ERROR) << getId() << ": fsvmd ended on its own";
         unmount();
+        EndObb(getId());  // the Watch thread holds a reference until this returns
     }
 }
 
@@ -193,10 +220,14 @@ status_t ObbVolume::mountInVm() {
     v.gid = mOwnerGid;
     v.volumeId = getId();
     v.target = obbPath;
-    if (fsvm::Mount(std::move(v), &mFsvmdPid) != OK) {
+    if (status_t res = fsvm::Mount(std::move(v), &mFsvmdPid); res != OK) {
+        if (res == -EAGAIN) {
+            LOG(ERROR) << getId() << " not mounted: no protected VM place is free, and OBB images come after drives";
+        }
         rmdir(obbPath.c_str());
         return -EIO;
     }
+    sObbInVm.push_back(this);
     sObbVms++;
     sObbVmsByOwner[mOwnerGid]++;
     sObbVmsByUser[user]++;
@@ -206,6 +237,7 @@ status_t ObbVolume::mountInVm() {
 void ObbVolume::stopInVm() {
     if (mFsvmdPid > 0) {
         // Read-only: nothing to write back, so no orderly wait.
+        sObbInVm.erase(std::remove(sObbInVm.begin(), sObbInVm.end(), this), sObbInVm.end());
         fsvm::Stop(mFsvmdPid, false);
         mFsvmdPid = -1;
         sObbVms--;
@@ -233,5 +265,6 @@ void VolumeManager::unmountObbsBelow(const std::string& path) {
     for (const auto& vol : below) {
         LOG(INFO) << vol->getId() << ": unmounting, its volume " << path << " goes";
         vol->unmount();
+        android::vold::EndObb(vol->getId());
     }
 }

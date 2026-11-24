@@ -26,6 +26,9 @@
     virtual void onCheckDone(pid_t pid, char state) {}
     /* The volume is about to go with others of its disk: start writing it back now (PublicVolume) */
     virtual void prepareStop() {}
+    /* The last mount found no protected VM place free: the volume shows as checking, and its disk makes it again for
+     * the framework to mount as soon as a place is free (PublicVolume, Disk::remakeWaitingVolumes) */
+    virtual bool waitingForPlace() const { return false; }
 
   protected:
     /* Whether the last failed mount failed in the filesystem VM (state kUnopenable) */
@@ -34,6 +37,7 @@
     virtual bool writeBackFailed() const { return false; }
     /* A failed mount (state set already), for a retry later (PublicVolume) */
     virtual void onMountFailed() {}
+
     /* Report a mounted volume as mounted read-only (the filesystem VM served it read-only) */
     void setReportReadOnly(bool readOnly) { mReportReadOnly = readOnly; }
     /* The same for a volume mounted already: the framework hears of it at once */

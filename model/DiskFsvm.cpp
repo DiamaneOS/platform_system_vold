@@ -21,6 +21,7 @@
  */
 
 #include "Disk.h"
+#include "ObbVolume.h"
 #include "PrivateVolume.h"
 #include "PublicVolume.h"
 #include "Utils.h"
@@ -36,6 +37,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <iterator>
 #include <mutex>
@@ -195,6 +197,108 @@ static void ScheduleReprobe(const std::string& diskId, int delaySeconds, Disk::R
     }).detach();
 }
 
+/*
+ * Waiting for a protected VM place (fsvm::Spawn found none): volumes by ID, disks whose probe waits by ID. With vold's
+ * lock held. Whenever fsvm gives a place back, the waiting volumes are mounted again and the waiting disks read again,
+ * in a thread of their own that takes vold's lock. A volume or disk that is gone meanwhile is dropped from the list.
+ */
+static std::set<std::string> sWaitingVolumes;
+static std::set<std::string> sWaitingDisks;
+static std::atomic<bool> sPlaceRetryScheduled{false};
+
+static void RetryWaitingForPlace() {
+    std::thread([] {
+        // The place given back is the hypervisor's once the old VM is gone: a moment for its crosvm to end.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        sPlaceRetryScheduled = false;
+        std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
+        auto disks = sWaitingDisks;
+        sWaitingDisks.clear();
+        for (const auto& id : disks) {
+            auto disk = VolumeManager::Instance()->findDisk(id);
+            if (disk) disk->reprobeInVm(Disk::Reprobe::kPlace);
+        }
+        auto volumes = sWaitingVolumes;
+        sWaitingVolumes.clear();
+        std::set<std::string> remade;
+        for (const auto& id : volumes) {
+            auto vol = VolumeManager::Instance()->findVolume(id);
+            if (!vol || !vol->waitingForPlace() || !remade.insert(vol->getDiskId()).second) continue;
+            auto disk = VolumeManager::Instance()->findDisk(vol->getDiskId());
+            if (disk) disk->remakeWaitingVolumes();
+        }
+        fsvm::SetDrivesWaiting(!sWaitingVolumes.empty() || !sWaitingDisks.empty());
+    }).detach();
+}
+
+/* Drops waiting volumes and disks that are gone (ejected while they waited). With vold's lock held. */
+static void PruneWaiting() {
+    for (auto it = sWaitingVolumes.begin(); it != sWaitingVolumes.end();) {
+        auto vol = VolumeManager::Instance()->findVolume(*it);
+        it = vol && vol->waitingForPlace() ? std::next(it) : sWaitingVolumes.erase(it);
+    }
+    for (auto it = sWaitingDisks.begin(); it != sWaitingDisks.end();) {
+        it = VolumeManager::Instance()->findDisk(*it) ? std::next(it) : sWaitingDisks.erase(it);
+    }
+    fsvm::SetDrivesWaiting(!sWaitingVolumes.empty() || !sWaitingDisks.empty());
+}
+
+static void EnsurePlaceHooks() {
+    static bool set = false;
+    if (set) return;
+    set = true;
+    // Room can also come free outside vold: a VM it did not start ends (a self-test's, a test VM). While anything
+    // waits, the pool and the piece count are read every 10 s, and the waiting drives try again once there is room.
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            bool waiting;
+            {
+                std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
+                PruneWaiting();
+                waiting = !sWaitingVolumes.empty() || !sWaitingDisks.empty();
+            }
+            if (waiting && fsvm::RoomForDrive() && !sPlaceRetryScheduled.exchange(true)) RetryWaitingForPlace();
+        }
+    }).detach();
+    fsvm::SetPlaceHooks([] { return ObbVolume::stopOneForDrive(); },
+                        [] {
+                            // Called with or without vold's lock: only a flag here, the work in a thread.
+                            if (sPlaceRetryScheduled.exchange(true)) return;
+                            RetryWaitingForPlace();
+                        });
+}
+
+void Disk::waitForPlace(const std::string& volumeId) {
+    EnsurePlaceHooks();
+    sWaitingVolumes.insert(volumeId);
+    fsvm::SetDrivesWaiting(true);
+}
+
+void Disk::waitForPlaceDisk(const std::string& diskId) {
+    EnsurePlaceHooks();
+    sWaitingDisks.insert(diskId);
+    fsvm::SetDrivesWaiting(true);
+}
+
+void Disk::remakeWaitingVolumes() {
+    std::vector<fsvm::Part> parts;
+    for (auto it = mVolumes.begin(); it != mVolumes.end();) {
+        // No RTTI in vold: the type says which volumes are public ones.
+        if ((*it)->getType() != VolumeBase::Type::kPublic || !(*it)->waitingForPlace()) {
+            ++it;
+            continue;
+        }
+        auto pub = std::static_pointer_cast<PublicVolume>(*it);
+        LOG(INFO) << pub->getId() << ": a protected VM place is free, made again for the framework to mount";
+        parts.push_back(pub->partInVm());
+        pub->destroy();
+        it = mVolumes.erase(it);
+        if (mPublicVolumes > 0) mPublicVolumes--;
+    }
+    for (const auto& part : parts) createPublicVolumeInVm(part);
+}
+
 /* Disks whose probe was put off, by ID: one pending retry each, however often the device comes back. Only touched
    with vold's lock held. */
 static std::set<std::string> sDeferred;
@@ -219,6 +323,14 @@ void Disk::reprobeInVm(Reprobe why) {
         case Reprobe::kDeferred:
             // The disk still shows the placeholder of the probe that was put off.
             if (!mProbeFailed) return;
+            mForceProbe = true;
+            readPartitions();
+            mForceProbe = false;
+            return;
+        case Reprobe::kPlace:
+            // The disk still shows the placeholder of the probe that found no place.
+            if (!mWaitingForPlace) return;
+            mWaitingForPlace = false;
             mForceProbe = true;
             readPartitions();
             mForceProbe = false;
@@ -354,8 +466,23 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     // Android's kernel did not read the table and sgdisk does not either: the filesystem VM does. Partitions vold
     // added before, or a kernel without the option made, go first.
     fsvm::Layout layout;
-    mProbeFailed = kernelScans || fsvm::DeleteAllPartitions(mDevPath, mSysPath) != OK ||
-                   fsvm::Probe(mDevPath, mSize, &layout) != OK;
+    EnsurePlaceHooks();
+    status_t probed = kernelScans ? -EIO : fsvm::DeleteAllPartitions(mDevPath, mSysPath);
+    if (probed == OK) probed = fsvm::Probe(mDevPath, mSize, &layout);
+    if (probed == -EAGAIN) {
+        // No protected VM place: the disk shows as one that could not be opened yet and is read as soon as a place is
+        // free, never shared with another drive's VM and never given up.
+        LOG(WARNING) << mId << ": waiting for a protected VM place to read the disk";
+        mProbeFailed = true;
+        mWaitingForPlace = true;
+        createUnopenableVolume();
+        waitForPlaceDisk(getId());
+        auto listener = VolumeManager::Instance()->getListener();
+        if (listener) listener->onDiskScanned(getId());
+        mJustPartitioned = false;
+        return OK;
+    }
+    mProbeFailed = probed != OK;
     // Everything made from this answer is bound to the medium it was read from (sequence read before the probe: a
     // medium changed during the probe fails the checks, never the other way round).
     layout.diskSeq = android::base::Trim(seq);

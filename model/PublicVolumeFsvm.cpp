@@ -377,10 +377,20 @@ status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
 status_t PublicVolume::mountInVm(gid_t gid) {
     mMountStartMs = systemTime(SYSTEM_TIME_BOOTTIME) / 1000000;
     mWriteBackFailed = false;
+    mWaitingForPlace = false;
     bool servedReadOnly = false;
-    if (serveInVm(gid, &servedReadOnly) != OK) {
-        LOG(ERROR) << getId() << " was not served by the filesystem VM";
+    if (status_t res = serveInVm(gid, &servedReadOnly); res != OK) {
         rmdir(mRawPath.c_str());
+        if (res == -EAGAIN) {
+            // No room for its VM: the pool and the hypervisor's budget of pieces are taken by the decode service's VM
+            // and other drives' VMs, never shared, never refused for good. The volume shows as waiting and mounts when
+            // room comes free (WaitForPlace).
+            LOG(WARNING) << getId() << ": waiting for a protected VM place, no room for its VM now";
+            mWaitingForPlace = true;
+            Disk::waitForPlace(getId());
+            return -EAGAIN;
+        }
+        LOG(ERROR) << getId() << " was not served by the filesystem VM";
         return -EIO;
     }
     // Served read-only by the VM (a write-protected card, or its driver found an error): the user gets a notice. A

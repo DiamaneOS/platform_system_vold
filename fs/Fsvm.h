@@ -23,6 +23,7 @@
 #include <sys/types.h>
 #include <utils/Errors.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -156,6 +157,9 @@ void Kill(pid_t pid);
 
 /* fsvmd's exit status when a repair did not leave the volume clean (fsvmd main.rs EXIT_NOT_REPAIRED) */
 static constexpr int kExitNotRepaired = 4;
+/* fsvmd's exit status when its VM was refused at its start for want of memory: no pool room and the pieces left of
+ * the hypervisor's budget too few (fsvmd main.rs EXIT_NO_ROOM) */
+static constexpr int kExitNoRoom = 5;
 /*
  * Starts a repair of `v` (a card's volume: its range, or the disk for a whole-disk filesystem) in a filesystem VM with
  * no time limit, and returns fsvmd's pid without waiting. Kill stops it at any time.
@@ -201,7 +205,21 @@ class ProbeMemory {
     int64_t mAtMs = 0;
 };
 
+/*
+ * Room for protected VMs: pool memory, or pieces of the hypervisor's budget for ordinary memory (Fsvm.cpp RoomFor).
+ * stopObbForDrive stops one OBB image's VM for a drive and says whether it did. onPlaceFree runs, without vold's lock,
+ * whenever one of vold's VMs ended. A start without room fails with EAGAIN, and so does a probe, format or mount whose
+ * VM the kernel or the hypervisor refused at its start (kExitNoRoom).
+ */
+void SetPlaceHooks(std::function<bool()> stopObbForDrive, std::function<void()> onPlaceFree);
+size_t PlacesInUse();
+/* Whether a drive waits for room: an OBB image's VM does not start meanwhile. */
+void SetDrivesWaiting(bool waiting);
+/* Whether a drive's VM would find room now, read from the pool and the piece count. */
+bool RoomForDrive();
+
 /* Counts a serving fsvmd that ended (Mount counts the ones that start). */
+
 void Served(bool obb, bool starting);
 
 /*
