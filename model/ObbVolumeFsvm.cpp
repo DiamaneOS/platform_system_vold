@@ -242,6 +242,14 @@ status_t ObbVolume::mountInVm() {
     return OK;
 }
 
+status_t ObbVolume::confirmEndInVm() {
+    if (getState() == State::kMounted) {
+        status_t res = unmount();
+        if (res != OK) return res;
+    }
+    return cleanupInVm();
+}
+
 status_t ObbVolume::cleanupInVm() {
     const std::string path = getPath();
     status_t res = path.empty() ? OK : ForceUnmount(path);

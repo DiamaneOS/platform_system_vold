@@ -79,6 +79,8 @@ status_t PrivateVolume::doCreate() {
 
     if (!setup_ext_volume(getId(), mRawDevPath, mKeyRaw, &mDmDevPath)) {
         LOG(ERROR) << getId() << " failed to setup metadata encryption";
+        // DiamaneOS: the stale mapper was removed above, so only this attempt can own one now.
+        DeleteDmDeviceWaiting(getId(), false);
         return -EIO;
     }
 

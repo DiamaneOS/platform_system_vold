@@ -51,6 +51,8 @@ namespace fsvm {
  */
 
 /* A partition the filesystem VM read from a disk, as fsvmd checked it. Sectors are 512 bytes. */
+struct StorageTestAccess;
+
 struct Part {
     /* Only the placeholder of a disk the VM could not read: it says so, and is never mounted or formatted */
     bool unread = false;
@@ -210,6 +212,7 @@ class ProbeMemory {
     bool holds(const std::string& seq, uint64_t size) const;
     /* The medium sequence the last read saw, empty before any read: what an erase must find (IsMedium). */
     std::string mediumRead() const { return mProbed ? mSeq : std::string(); }
+    uint64_t bytesRead() const { return mSize; }
     /* The disk's volumes went without a new medium (vold reset): the next read makes them again. */
     void forget() { mProbed = false; }
 
@@ -274,9 +277,21 @@ status_t CreateRange(const std::string& name, dev_t disk, uint64_t start, uint64
 status_t DeleteRange(const std::string& name, const std::string& node);
 /* Removes every range of `disk` left from before (vold restarted, a medium changed). */
 void DeleteRangesOf(dev_t disk);
-/* Turns every range of `disk` into one that fails all I/O: the medium under them changed, and nothing written for the
- * old one (a VM's write back, a private volume's unmount) may reach the new one at the old one's offsets. */
-void FailRangesOf(dev_t disk);
+/* Holds the actual lower mapping given to a VM or used for an adopted volume. */
+struct RangeBacking {
+    std::string name;
+    android::base::unique_fd fd;
+    uint64_t sectors;
+    bool readOnly;
+    bool fenceStarted = false;
+};
+/* Opens the newly created mapper by its expected device number. */
+android::base::unique_fd OpenRange(const std::string& node, dev_t expected, bool readOnly);
+/* Isolates this mapping without flushing it. Success requires an active, full-length error table. */
+status_t FenceRange(RangeBacking* range);
+/* Global FUSE aborts skip raw VM drive connections. Individual teardown has its own guard. */
+bool ProtectDriveFuse(unsigned connection);
+bool AbortUnprotectedFuse(const std::string& abortPath);
 /* Removes the ranges of disks that are gone (unplugged while a VM still held a range). */
 void SweepRanges();
 
@@ -301,6 +316,8 @@ status_t ClaimNode(const std::string& path, dev_t dev);
  * an unknown sequence (none recorded, or none readable now) is never a match.
  */
 bool IsMedium(dev_t disk, const std::string& seq);
+// True only when two known kernel generations differ.
+bool MediumChanged(dev_t disk, const std::string& seq);
 /* Whether `disk` is `bytes` long now, as the kernel counts it. */
 bool HasSize(dev_t disk, uint64_t bytes);
 /*
@@ -311,7 +328,13 @@ bool HasSize(dev_t disk, uint64_t bytes);
 status_t OpenToErase(const std::string& path, dev_t disk, uint64_t bytes, const std::string& seq,
                      android::base::unique_fd* fd, uint32_t* blockSize);
 /* Writes table `t` through `fd` (OpenToErase): the disk's last MiB, then its first, then a flush. Reads nothing. */
-status_t WriteTable(int fd, const Table& t);
+status_t WriteTable(int fd, const Table& t, const std::function<bool()>& mayWrite);
+/* Only MMC gives each inserted card a separate gendisk and queue. SCSI readers can replace media under an open fd. */
+bool FencesMedium(dev_t disk);
+bool EraseDescriptor(int fd, dev_t disk, uint64_t bytes, const std::string& seq);
+bool MatchesTable(const Layout& layout, const TableRequest& request, const Table& table);
+/* Only an explicit retry may recreate an unread volume during a mount. */
+bool ReprobeOnMount(bool unread, bool explicitRetry);
 
 }  // namespace fsvm
 }  // namespace vold

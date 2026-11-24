@@ -20,6 +20,7 @@
  */
   public:
     status_t cleanupInVm();
+    status_t confirmEndInVm();
     void onFsvmdExit(pid_t pid) override;
     /* The OBB file vold opens (below /data/media, or below a public volume's /mnt/media_rw/<uuid>) */
     const std::string& getSourcePath() const { return mSourcePath; }

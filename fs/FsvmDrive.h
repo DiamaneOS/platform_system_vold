@@ -56,6 +56,7 @@ class DriveControl {
     void settle();
     /* Whether a request that changes partition `disk` is still pending. */
     bool pending(int disk) const;
+    bool hasPending() const { return !mPending.empty(); }
 
   private:
     /* One answer within `timeoutMs` (0: only one that is there now). */
@@ -71,6 +72,7 @@ class DriveControl {
 /* fsvmd's FORMAT answers besides 0 and an errno (drive_msg.rs FORMAT_UNVERIFIED, FORMAT_UNCERTAIN). */
 static constexpr int kFormatUnverified = 4001;
 static constexpr int kFormatUncertain = 4002;
+static constexpr int kFormatUncertainStopped = 4003;
 
 /*
  * What a format's answer means for partition `p` formatted as `fsType` (Drive::format): OK with `out` the new
@@ -126,6 +128,11 @@ class Drive {
                     bool readOnly, pid_t* serving, bool* servedReadOnly, bool* checking = nullptr);
     /* Whether the drive's disk opened read-only (its write-protect switch) when its VM started */
     bool readOnly() const { return mReadOnly; }
+    bool attached(const Part& p) const;
+    /* Decide before any FUSE disconnect or detach. */
+    status_t prepareDetach(const Part& p);
+    bool hasBackings() const { return !mRanges.empty(); }
+    status_t fenceBackings(bool all);
     /*
      * The partition's FUSE mount went (or a mount failed): it is written back and unmounted in the VM (`orderly`), or
      * ended at once. 0, kExitNotWrittenBack, or -1 when the drive's fsvmd had ended. The VM ends with the last one.
@@ -136,13 +143,18 @@ class Drive {
      * (-ENODEV) before anything is started or written unless the disk still holds the medium `p` was read from (a
      * known sequence) and has its size, checked again once the VM runs. `recheck`: FormatOutcome.
      */
-    status_t format(const Part& p, const std::string& fsType, Part* out, bool* recheck);
+    status_t format(const Part& p, const std::string& fsType, Part* out, bool* recheck,
+                    bool* writerStopped);
+    bool hasUnfinishedMutation();
 
     /* A repair keeps the VM while its partition is unmounted for it: before the unmount, and repairEnded after. */
     void holdForRepair();
     void repairEnded();
     /* Starts the repair of `p` with no time limit and returns its token for WaitDriveRepair, or -1. */
     pid_t startRepair(const Part& p);
+    /* Refuse an unsafe repair before its preliminary unmount can write back. */
+    bool prepareRepair(const Part& p);
+    bool prepareFormat(const Part& p) { return prepareRepair(p); }
     /* An eject or removal during the repair stops it (the partition keeps its dirty mark), and repairEnded. */
     void cancelRepair(const Part& p);
 
@@ -156,6 +168,7 @@ class Drive {
     std::function<void()> stuck(const Part& p) const;
 
   private:
+    friend struct StorageTestAccess;
     int indexOf(const Part& p) const;
     status_t start();
     status_t request(const std::string& msg, const std::vector<int>& fds, char kind, int disk, bool mutating,
@@ -171,11 +184,11 @@ class Drive {
     /* The disk's ID (disk:179,0): fsvmd --drive names it, so that `ps` shows which drive a VM serves */
     std::string mDiskId;
     std::vector<Part> mParts;
-    /* The ranges set up for the running VM (dm name, vold's node) and each partition's node (a range, or the disk) */
-    std::vector<std::pair<std::string, std::string>> mRanges;
-    std::vector<std::string> mNodes;
+    /* Actual block descriptors passed to fsvmd, in VM slot order. */
+    std::vector<RangeBacking> mRanges;
     uint64_t mDiskBytes = 0;
     bool mReadOnly = false;
+    android::base::unique_fd mMediumFd;
     pid_t mPid = -1;
     DriveControl mControl;
     std::set<int> mAttached;

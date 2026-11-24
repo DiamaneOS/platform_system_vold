@@ -104,12 +104,10 @@ Disk::Disk(const std::string& eventPath, dev_t device, const std::string& nickna
     mEventPath = eventPath;
     mSysPath = StringPrintf("/sys/%s", eventPath.c_str());
     mDevPath = StringPrintf("/dev/block/vold/%s", mId.c_str());
-    CreateDeviceNode(mDevPath, mDevice);
 }
 
 Disk::~Disk() {
     CHECK(!mCreated);
-    DestroyDeviceNode(mDevPath);
 }
 
 std::shared_ptr<VolumeBase> Disk::findVolume(const std::string& id) {
@@ -147,6 +145,10 @@ std::vector<std::shared_ptr<VolumeBase>> Disk::getVolumes() const {
 
 status_t Disk::create() {
     CHECK(!mCreated);
+    // DiamaneOS: a queued replacement owns no node until the original has stopped.
+    if (!isStub()) {
+        if (auto res = CreateDeviceNode(mDevPath, mDevice); res != OK) return res;
+    }
     mCreated = true;
 
     auto listener = VolumeManager::Instance()->getListener();
@@ -161,10 +163,13 @@ status_t Disk::create() {
     return OK;
 }
 
-status_t Disk::destroy() {
+status_t Disk::destroy(bool removed) {
     CHECK(mCreated);
+    mRemovalPending |= removed;  // DiamaneOS: retain the removal event if teardown must be retried
     DIAMANEOS_FS_IN_VM(beforeDestroyInVm();)  // DiamaneOS: DiskFsvm.cpp
-    destroyAllVolumes();
+    if (auto res = destroyAllVolumes(); res != OK) return res;
+    mRemovalPending = false;
+    if (!isStub()) DestroyDeviceNode(mDevPath);  // DiamaneOS: release before a replacement can activate
     mCreated = false;
 
     auto listener = VolumeManager::Instance()->getListener();
@@ -231,13 +236,14 @@ void Disk::createStubVolume() {
     mVolumes[0]->create();
 }
 
-void Disk::destroyAllVolumes() {
-    DIAMANEOS_FS_IN_VM(prepareStopAll();)  // DiamaneOS: all volumes of the disk write back at once
+status_t Disk::destroyAllVolumes() {
+    DIAMANEOS_FS_IN_VM(if (auto res = prepareStopAll(); res != OK) return res;)
     for (const auto& vol : mVolumes) {
-        vol->destroy();
+        vol->destroy(true);  // DiamaneOS: prepareStopAll checked the whole disk
     }
     mVolumes.clear();
     DIAMANEOS_FS_IN_VM(removeRanges();)  // DiamaneOS: and their device-mapper ranges go
+    return OK;
 }
 
 status_t Disk::readMetadata() {
@@ -334,6 +340,7 @@ status_t Disk::readPartitions() {
 
     DIAMANEOS_FS_IN_VM(if (isVmDisk()) return readPartitionsInVm(maxMinors);)  // DiamaneOS: read in the VM
 
+    DIAMANEOS_FS_IN_VM(publishDebugMedium();)  // DiamaneOS: confirmed debug loop identity
     destroyAllVolumes();
 
     // Parse partition table
@@ -446,9 +453,9 @@ void Disk::initializePartition(std::shared_ptr<StubVolume> vol) {
 }
 
 status_t Disk::unmountAll() {
-    DIAMANEOS_FS_IN_VM(prepareStopAll();)  // DiamaneOS
+    DIAMANEOS_FS_IN_VM(if (auto res = prepareStopAll(); res != OK) return res;)
     for (const auto& vol : mVolumes) {
-        vol->unmount();
+        vol->unmount(true);  // DiamaneOS: prepareStopAll checked the whole disk
     }
     return OK;
 }

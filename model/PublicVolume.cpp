@@ -255,6 +255,7 @@ status_t PublicVolume::doMount() {
 
     if (result != 0) {
         LOG(ERROR) << "Failed to mount public fuse volume";
+        DIAMANEOS_FS_IN_VM(guard.reset(); if (auto res = prepareUnmount(); res != OK) return res;)
         doUnmount();
         return -result;
     }
@@ -266,6 +267,7 @@ status_t PublicVolume::doMount() {
         callback->onVolumeChecking(std::move(fd), getPath(), getInternalPath(), &is_ready);
         if (!is_ready) {
             LOG(ERROR) << "Failed to complete public volume mount";
+            DIAMANEOS_FS_IN_VM(guard.reset(); if (auto res = prepareUnmount(); res != OK) return res;)
             doUnmount();
             return -EIO;
         }

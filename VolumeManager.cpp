@@ -255,6 +255,11 @@ void VolumeManager::handleBlockEvent(NetlinkEvent* evt) {
 }
 
 void VolumeManager::handleDiskAdded(const std::shared_ptr<android::vold::Disk>& disk) {
+    // DiamaneOS: keep a pending replacement through an unsafe teardown, without claiming its node.
+    auto existing = std::find_if(mPendingDisks.begin(), mPendingDisks.end(), [&](const auto& pending) {
+        return pending->getDevice() == disk->getDevice();
+    });
+    if (existing == mPendingDisks.end()) mPendingDisks.push_back(disk);
     // For security reasons, if secure keyguard is showing, wait
     // until the user unlocks the device to actually touch it
     // Additionally, wait until user 0 is actually started, since we need
@@ -263,20 +268,21 @@ void VolumeManager::handleDiskAdded(const std::shared_ptr<android::vold::Disk>& 
     if (mSecureKeyguardShowing) {
         LOG(INFO) << "Found disk at " << disk->getEventPath()
                   << " but delaying scan due to secure keyguard";
-        mPendingDisks.push_back(disk);
     } else if (!userZeroStarted) {
         LOG(INFO) << "Found disk at " << disk->getEventPath()
                   << " but delaying scan due to user zero not having started";
-        mPendingDisks.push_back(disk);
     } else {
-        disk->create();
-        mDisks.push_back(disk);
+        createPendingDisksIfNeeded();
     }
 }
 
 void VolumeManager::handleDiskChanged(dev_t device) {
     for (const auto& disk : mDisks) {
         if (disk->getDevice() == device) {
+            if (disk->removalPending()) {  // DiamaneOS: retry the queued ADD without reprobe of the old disk
+                createPendingDisksIfNeeded();
+                return;
+            }
             disk->readMetadata();
             disk->readPartitions();
         }
@@ -290,8 +296,11 @@ void VolumeManager::handleDiskRemoved(dev_t device) {
     auto i = mDisks.begin();
     while (i != mDisks.end()) {
         if ((*i)->getDevice() == device) {
-            (*i)->destroy();
-            i = mDisks.erase(i);
+            if ((*i)->destroy(true) == OK) {  // DiamaneOS: a refused teardown keeps custody
+                i = mDisks.erase(i);
+            } else {
+                ++i;
+            }
         } else {
             ++i;
         }
@@ -550,11 +559,16 @@ void VolumeManager::createPendingDisksIfNeeded() {
     if (!mSecureKeyguardShowing && userZeroStarted) {
         // Now that secure keyguard has been dismissed and user 0 has
         // started, process any pending disks
-        for (const auto& disk : mPendingDisks) {
-            disk->create();
-            mDisks.push_back(disk);
+        for (auto it = mPendingDisks.begin(); it != mPendingDisks.end();) {
+            auto disk = *it;
+            const auto res = replaceRetainedDisk(disk->getDevice());  // DiamaneOS: release old node first
+            if (res != -EEXIST && (res != OK || disk->create() != OK)) {
+                ++it;
+                continue;
+            }
+            if (res == OK) mDisks.push_back(disk);
+            it = mPendingDisks.erase(it);
         }
-        mPendingDisks.clear();
     }
 }
 
@@ -965,9 +979,18 @@ int VolumeManager::abortFuse() {
     return android::vold::AbortFuseConnections();
 }
 
-int VolumeManager::reset() {
+int VolumeManager::reset(bool preflightOnly) {
     // Tear down all existing disks/volumes and start from a blank slate so
     // newly connected framework hears all events.
+
+    // DiamaneOS: check removable disks before changing any storage state.
+    for (const auto& disk : mDisks) {
+        if (disk->preflightStop() != OK) return -EAGAIN;
+    }
+    if (preflightOnly) return OK;
+
+    // DiamaneOS: recheck each disk as it stops. Keep internal storage alive if a check now fails.
+    if (auto res = resetRemovableDisks(true); res != OK) return res;
 
     // Destroy StubVolume disks. This needs to be done before destroying
     // EmulatedVolumes because in ARC (Android on ChromeOS), ChromeOS Downloads
@@ -991,12 +1014,7 @@ int VolumeManager::reset() {
     }
     mInternalEmulatedVolumes.clear();
 
-    // Destroy and recreate non-StubVolume disks.
-    for (const auto& disk : mDisks) {
-        disk->destroy();
-        disk->create();
-    }
-
+    resetRemovableDisks(false);  // DiamaneOS: stock disks keep their usual order.
     updateVirtualDisk();
     mAddedUsers.clear();
     mStartedUsers.clear();
@@ -1010,7 +1028,7 @@ int VolumeManager::reset() {
 
 // Can be called twice (sequentially) during shutdown. should be safe for that.
 int VolumeManager::shutdown() {
-    if (mInternalEmulatedVolumes.empty()) {
+    if (mInternalEmulatedVolumes.empty() && mDisks.empty()) {
         return 0;  // already shutdown
     }
     android::vold::sSleepOnUnmount = false;
@@ -1024,18 +1042,13 @@ int VolumeManager::shutdown() {
     for (const auto& vol : mInternalEmulatedVolumes) {
         vol->destroy();
     }
-    for (const auto& disk : mDisks) {
-        if (!disk->isStub()) {
-            disk->destroy();
-        }
-    }
+    const int result = destroyShutdownDisks();  // DiamaneOS: retain any refused teardown
 
     mInternalEmulatedVolumes.clear();
-    mDisks.clear();
     mPendingDisks.clear();
     android::vold::sSleepOnUnmount = true;
 
-    return 0;
+    return result;
 }
 
 int VolumeManager::unmountAll() {
@@ -1047,7 +1060,7 @@ int VolumeManager::unmountAll() {
     // comment in VolumeManager::reset()).
     for (const auto& disk : mDisks) {
         if (disk->isStub()) {
-            disk->unmountAll();
+            if (auto res = disk->unmountAll(); res != OK) return res;
         }
     }
     for (const auto& vol : mInternalEmulatedVolumes) {
@@ -1055,7 +1068,7 @@ int VolumeManager::unmountAll() {
     }
     for (const auto& disk : mDisks) {
         if (!disk->isStub()) {
-            disk->unmountAll();
+            if (auto res = disk->unmountAll(); res != OK) return res;  // DiamaneOS: skip the global fallback
         }
     }
 
@@ -1235,14 +1248,8 @@ int VolumeManager::destroyObb(const std::string& volId) {
     auto i = mObbVolumes.begin();
     while (i != mObbVolumes.end()) {
         if ((*i)->getId() == volId) {
-            // DiamaneOS: a failed native unmount is not a confirmed terminal cleanup.
-            if ((*i)->getState() == VolumeBase::State::kMounted) {
-                status_t res = (*i)->unmount();
-                if (res != OK) return res;
-            }
-            DIAMANEOS_FS_IN_VM(if (status_t res = static_cast<android::vold::ObbVolume*>((*i).get())->cleanupInVm(); res != OK) return res;)  // DiamaneOS
-            status_t res = (*i)->destroy();
-            if (res != OK) return res;
+            DIAMANEOS_FS_IN_VM(if (auto res = static_cast<android::vold::ObbVolume*>((*i).get())->confirmEndInVm(); res != OK) return res;)  // DiamaneOS: ObbVolumeFsvm.cpp
+            (*i)->destroy();
             i = mObbVolumes.erase(i);
         } else {
             ++i;

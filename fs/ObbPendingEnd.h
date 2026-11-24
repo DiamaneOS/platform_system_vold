@@ -7,23 +7,23 @@
 #include <string>
 #include <utility>
 namespace android::vold::fsvm {
-// Manager-lock confined ownership of spontaneous ends until lower cleanup succeeds.
+// Manager-lock confined scheduling for spontaneous ends.
 class ObbPendingEnd {
   public:
     using End = std::function<bool(const std::string&)>;
     using Delay = std::function<void(std::function<void()>)>;
     void end(const std::string& id, End destroy, Delay delay) {
-        if (destroy(id)) { mEntries.erase(id); return; }
-        if (!mEntries.insert(id).second) return;
-        retry(id, std::move(destroy), std::move(delay));
+        if (pending(id) || destroy(id)) return;
+        mEntries.insert(id);
+        retry(id, kRetries, std::move(destroy), std::move(delay));
     }
     bool pending(const std::string& id) const { return mEntries.count(id); }
   private:
-    void retry(std::string id, End destroy, Delay delay) {
-        delay([this, id, destroy, delay] {
-            if (!mEntries.count(id)) return;
-            if (destroy(id)) mEntries.erase(id);
-            else retry(id, destroy, delay);
+    static constexpr int kRetries = 3;
+    void retry(std::string id, int remaining, End destroy, Delay delay) {
+        delay([this, id, remaining, destroy, delay] {
+            if (destroy(id) || remaining == 1) mEntries.erase(id);
+            else retry(id, remaining - 1, destroy, delay);
         });
     }
     std::set<std::string> mEntries;

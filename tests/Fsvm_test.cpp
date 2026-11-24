@@ -483,7 +483,7 @@ TEST(FsvmTest, FormatOutcomes) {
     EXPECT_EQ(-EAGAIN, FormatOutcome(OK, EAGAIN, "", p, "vfat", &out, &recheck));
     EXPECT_FALSE(recheck);
     EXPECT_EQ(-EIO, FormatOutcome(OK, EIO, "", p, "vfat", &out, &recheck));
-    EXPECT_FALSE(recheck);
+    EXPECT_TRUE(recheck);
 }
 
 // B2: a format refuses a medium it cannot name as the one it read, before anything opens the disk (no discard, no VM
@@ -505,8 +505,11 @@ TEST(FsvmTest, FormatTouchesNothingOnAnUnknownMedium) {
         d.setParts({p});
         Part out;
         bool recheck = true;
-        EXPECT_EQ(-ENODEV, d.format(p, "vfat", &out, &recheck)) << "sequence '" << seq << "'";
+        bool writerStopped = true;
+        EXPECT_EQ(-ENODEV, d.format(p, "vfat", &out, &recheck, &writerStopped))
+                << "sequence '" << seq << "'";
         EXPECT_FALSE(recheck);
+        EXPECT_FALSE(writerStopped);
     }
     char buf[4096];
     EXPECT_LE(read(watch.get(), buf, sizeof(buf)), 0) << "the disk was opened";

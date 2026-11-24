@@ -35,8 +35,27 @@
     void dropMedium();
     /* A repair of this volume failed or could not start (Disk::remakePublicVolume): read-only for good */
     void markRepairFailed() { mRepairFailed = true; }
+    bool repairFailedInVm() const { return mRepairFailed; }
+    void markReadOnlyRequestedInVm() { mRequestedReadOnly = true; }
+    bool explicitReadOnlyInVm() const { return mRequestedReadOnly || (getMountFlags() & MountFlags::kReadOnly); }
+    bool readOnlyRequestedInVm() const { return mRepairFailed || explicitReadOnlyInVm(); }
+    bool unreadInVm() const { return mInVm && (mPart.unread || mFormatPending); }
+    void markFormatPendingInVm(bool complete, bool writerStopped) {
+        mFormatPending = true;
+        mFormatCompleted = complete;
+        mFormatWriterStopped = writerStopped;
+        showFormatOutcome();
+    }
 
   protected:
+    status_t prepareUnmount() override;
+    bool hasUnmountWork() const override { return mInVm && mAttached; }
+    status_t prepareFormat() override;
+    State formatOutcomeState() const override {
+        if (!mFormatPending) return State::kUnmounted;
+        if (mFormatCompleted) return State::kFormattedUnverified;
+        return mFormatWriterStopped ? State::kFormatResultUnverified : State::kUnopenable;
+    }
     bool mountFailedInVm() const override { return mVmFailed; }
     bool writeBackFailed() const override { return mWriteBackFailed; }
     void onFsvmdExit(pid_t pid) override;
@@ -107,6 +126,9 @@
     void stopInVm();
 
     /* Phase 2: the partition the VM read, on the whole disk at mDiskDevPath */
+    bool mFormatPending = false;
+    bool mFormatCompleted = false;
+    bool mFormatWriterStopped = false;
     bool mInVm = false;
     fsvm::Part mPart;
     std::string mDiskDevPath;
@@ -119,3 +141,6 @@
     /* The repair running for the volume (an fsvmd's pid, or a drive's token), or -1, and whether a repair failed */
     pid_t mRepairPid = -1;
     bool mRepairFailed = false;
+    bool mRequestedReadOnly = false;
+
+    friend struct fsvm::StorageTestAccess;

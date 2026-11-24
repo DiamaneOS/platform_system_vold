@@ -88,8 +88,17 @@ pid_t PublicVolume::startRepairInVm(pid_t serving) {
     if (mDrive) {
         // In its drive's VM, which stays while the partition is unmounted for the repair. Nothing to write back: the
         // volume was read-only since its mount.
+        if (!mDrive->prepareRepair(mPart)) {
+            mRepairFailed = true;
+            announceReadOnly(true);
+            announceCheckPending(false);
+            return -1;
+        }
         mDrive->holdForRepair();
-        unmount();
+        if (unmount() != OK) {
+            mDrive->repairEnded();
+            return -1;
+        }
         showChecking();
         mRepairPid = mDrive->startRepair(mPart);
         if (mRepairPid == -1) {
@@ -149,6 +158,10 @@ void PublicVolume::remakeAfterRepair(bool failed) {
         setUnopenable();
         return;
     }
+    if (!failed) {
+        mRepairFailed = false;
+        disk->noteRecovered(mPart);
+    }
     disk->remakePublicVolume(getId(), failed);
 }
 
@@ -174,6 +187,8 @@ PublicVolume::UnmountInVm::UnmountInVm(PublicVolume* vol) : mVol(vol) {
 PublicVolume::UnmountInVm::~UnmountInVm() {
     mStuck.reset();
     mVol->stopInVm();
+    auto disk = VolumeManager::Instance()->findDisk(mVol->getDiskId());
+    if (disk) disk->resumeFormatVerification();
 }
 
 void PublicVolume::UnmountInVm::fuseGone() {
@@ -182,6 +197,7 @@ void PublicVolume::UnmountInVm::fuseGone() {
 }
 
 status_t PublicVolume::checkInVm() {
+    if (getMountFlags() & MountFlags::kReadOnly) mRequestedReadOnly = true;
     mVmFailed = false;
     mWaitingForPlace = false;
     if (mInVm) {
@@ -248,8 +264,7 @@ status_t PublicVolume::checkInVm() {
 void PublicVolume::onFsvmdExit(pid_t serving) {
     if (serving != mServing || getState() != State::kMounted) return;
     LOG(ERROR) << getId() << ": fsvmd ended on its own, the volume could not be served any more";
-    unmount();
-    setUnopenable();
+    if (unmount() == OK && !mWriteBackFailed) setUnopenable();
 }
 
 void PublicVolume::onCheckDone(pid_t serving, char state) {
@@ -306,10 +321,9 @@ void PublicVolume::onCheckDone(pid_t serving, char state) {
 
 void PublicVolume::dropMedium() {
     // A card swapped in a USB reader: a write back would reach the new card at the old one's offsets. The disk has
-    // cut the ranges off already (fsvm::FailRangesOf) and killed its drive's fsvmd (Disk::dropOldMedium).
+    // verified isolation and stopped its drive (Disk::dropOldMedium).
     if (mDrive) {
         if (mAttached) mWriteBackFailed = true;
-        mAttached = false;
         mServing = 0;
         return;
     }
@@ -328,7 +342,7 @@ void PublicVolume::noteNotWrittenBack() {
 }
 
 bool PublicVolume::readOnlyForGood() const {
-    return mRepairFailed || (mDrive && mDrive->readOnly());
+    return readOnlyRequestedInVm() || (mDrive && mDrive->readOnly());
 }
 
 status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly, bool* checking) {
@@ -342,9 +356,9 @@ status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly, bool* check
     // through /storage closes, which stock's FAT and exFAT drivers let group media_rw do (allow_utime).
     pid_t serving = 0;
     status_t res = mDrive->attach(mPart, gid, fsvm::MediaProviderUid(getMountUserId()), getId(), mRawPath,
-                                  mRepairFailed, &serving, servedReadOnly, checking);
+                                  readOnlyRequestedInVm(), &serving, servedReadOnly, checking);
+    mAttached = mDrive->attached(mPart);
     if (res != OK) return res;
-    mAttached = true;
     mServing = serving;
     return OK;
 }
@@ -354,7 +368,7 @@ status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly, bool* checking
     // A volume on a partition device of its own (a virtual disk): a VM of its own sees it as a whole disk.
     fsvm::Volume v;
     // A failed repair keeps it read-only.
-    v.readOnly = mRepairFailed;
+    v.readOnly = readOnlyRequestedInVm();
     v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), (v.readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC)));
     if (v.fd < 0 && !v.readOnly && (errno == EROFS || errno == EACCES)) {
         v.readOnly = true;
@@ -387,7 +401,7 @@ status_t PublicVolume::mountInVm(gid_t gid) {
     mWaitingForPlace = false;
     bool servedReadOnly = false, checking = false;
     if (status_t res = serveInVm(gid, &servedReadOnly, &checking); res != OK) {
-        rmdir(mRawPath.c_str());
+        if (!mAttached) rmdir(mRawPath.c_str());
         if (res == -EAGAIN) {
             // No room for its VM: the pool and the hypervisor's budget of pieces are taken by the decode service's VM
             // and other drives' VMs, never shared, never refused for good. The volume shows as waiting and mounts when
@@ -414,6 +428,17 @@ int PublicVolume::guardMs() const {
     // whatever the VM left of 52 s, at least 15 s: a quick VM mount leaves them more. vold holds its lock throughout.
     int64_t spent = fsvm::NowMs() - mMountStartMs;
     return static_cast<int>(std::max<int64_t>(15000, 52000 - spent));
+}
+
+status_t PublicVolume::prepareUnmount() {
+    if (!mInVm || !mAttached) return OK;
+    const status_t res = mDrive->prepareDetach(mPart);
+    if (res != OK) {
+        LOG(ERROR) << getId() << ": the original backing could not be isolated (" << res << "), retaining the mount";
+        mWriteBackFailed = true;
+        noteNotWrittenBack();
+    }
+    return res;
 }
 
 void PublicVolume::stopInVm() {
@@ -445,6 +470,15 @@ void PublicVolume::stopInVm() {
     }
     mFsvmdPid = -1;
     mServing = 0;
+}
+
+status_t PublicVolume::prepareFormat() {
+    if (!mInVm) return OK;
+    if (mFormatPending) return -EBUSY;
+    if (mPart.unread || mPart.damaged || !mDrive) return -EIO;
+    auto disk = VolumeManager::Instance()->findDisk(getDiskId());
+    if (disk && disk->notWrittenBack(getId())) return -EBUSY;
+    return mDrive->prepareFormat(mPart) ? OK : -ENOTSUP;
 }
 
 status_t PublicVolume::formatInVm(const std::string& fsType) {
@@ -479,15 +513,26 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
     // filesystem has a new serial, so the UUID changes: the VM reads it, as blkid did at mount.
     fsvm::Part formatted;
     bool recheck = false;
-    status_t res = mDrive->format(mPart, pick, &formatted, &recheck);
+    bool writerStopped = false;
+    status_t res = mDrive->format(mPart, pick, &formatted, &recheck, &writerStopped);
     if (recheck && disk) {
         // Formatted without a read back, or perhaps formatted: a new probe shows what the medium holds now.
-        disk->recheckAfterFormat();
+        disk->recheckAfterFormat(mPart, pick, res == OK, writerStopped);
+    }
+    if (recheck) {
+        mFormatPending = true;
+        mFormatWriterStopped = writerStopped;
+    }
+    if (res == OK && recheck) {
+        mPart = formatted;
+        mFormatCompleted = true;
+        return OK;
     }
     if (res != OK) {
         LOG(ERROR) << getId() << " failed to format" << (recheck ? ", perhaps in part: the disk is read again" : "");
         return -EIO;
     }
+    // A format reply cannot clear the host's failed-repair hold.
     mPart = formatted;
     return OK;
 }

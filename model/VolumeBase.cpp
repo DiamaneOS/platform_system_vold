@@ -180,11 +180,16 @@ std::shared_ptr<VolumeBase> VolumeBase::findVolume(const std::string& id) {
     return nullptr;
 }
 
-status_t VolumeBase::create() {
+status_t VolumeBase::create(bool publishOnFailure) {
     CHECK(!mCreated);
 
     mCreated = true;
     status_t res = doCreate();
+    // DiamaneOS: a targeted retry publishes its replacement only when setup succeeds.
+    if (res != OK && !publishOnFailure) {
+        mCreated = false;
+        return res;
+    }
 
     auto listener = getListener();
     if (listener) {
@@ -200,11 +205,12 @@ status_t VolumeBase::doCreate() {
     return OK;
 }
 
-status_t VolumeBase::destroy() {
+status_t VolumeBase::destroy(bool stopChecked) {
     CHECK(mCreated);
 
-    if (mState == State::kMounted) {
-        unmount();
+    if (mState == State::kMounted || hasUnmountWork()) {  // DiamaneOS: an unpublished raw mount can remain
+        if (auto res = unmount(stopChecked);
+            res != OK && (mState == State::kMounted || hasUnmountWork())) return res;
         setState(State::kBadRemoval);
     } else {
         setState(State::kRemoved);
@@ -230,6 +236,7 @@ status_t VolumeBase::mount() {
         return -EBUSY;
     }
 
+    DIAMANEOS_FS_IN_VM(if (auto res = hasUnmountWork() ? unmount() : OK; res != OK) return res;)
     setState(State::kChecking);
     status_t res = doMount();
     if (res == OK) setState(State::kMounted); else mountFailed();  // DiamaneOS: VolumeBaseFsvm.cpp
@@ -242,13 +249,14 @@ status_t VolumeBase::mount() {
 
 void VolumeBase::doPostMount() {}
 
-status_t VolumeBase::unmount() {
+status_t VolumeBase::unmount([[maybe_unused]] bool stopChecked) {
     if (mState == State::kChecking && cancelRepairInVm()) return OK;  // DiamaneOS: an eject stops a repair
-    if (mState != State::kMounted) {
+    if (mState != State::kMounted && !hasUnmountWork()) {  // DiamaneOS: also retire an unpublished raw mount
         LOG(WARNING) << getId() << " unmount requires state mounted";
         return -EBUSY;
     }
 
+    DIAMANEOS_FS_IN_VM(if (auto res = stopChecked ? OK : prepareUnmount(); res != OK) return res;)
     setState(State::kEjecting);
     for (const auto& vol : mVolumes) {
         if (vol->destroy()) {
@@ -263,6 +271,7 @@ status_t VolumeBase::unmount() {
 }
 
 status_t VolumeBase::format(const std::string& fsType) {
+    DIAMANEOS_FS_IN_VM(if (auto res = prepareFormat(); res != OK) return res;)  // DiamaneOS: refusal before teardown
     if (mState == State::kMounted) {
         unmount();
     }
@@ -274,7 +283,8 @@ status_t VolumeBase::format(const std::string& fsType) {
 
     setState(State::kFormatting);
     status_t res = doFormat(fsType);
-    setState(State::kUnmounted);
+    // DiamaneOS: completed mkfs with pending readback has its own visible outcome.
+    setState(formatOutcomeState());
     return res;
 }
 
