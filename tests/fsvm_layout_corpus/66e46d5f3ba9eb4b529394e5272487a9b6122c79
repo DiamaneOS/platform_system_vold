@@ -1,0 +1,4 @@
+FSVMD-OU
+LAYOUT 1 mbr 1
+PART 1 public 8 1 vfat 6FFF-FAB8 - 4 67448aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa15244
+END

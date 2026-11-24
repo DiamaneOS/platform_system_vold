@@ -1,0 +1,6 @@
+FSVMD-OUTPUT 2199023255552 512 3361d4a4b0fded22
+LAYOUT 1 mbr 3
+PART 1 public 34 4294967222 bad - - 0 -
+PART 2 public 4294967256 7 bad - - 0 -
+PART 3 public 4294967263 33 bad - - 0 -
+END

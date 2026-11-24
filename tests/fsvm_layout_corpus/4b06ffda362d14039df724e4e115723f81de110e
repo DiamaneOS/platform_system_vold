@@ -1,0 +1,4 @@
+FSV12 8e
+LAYOUT 1 mbr 1
+PART 1 public 4 1 vfat 6FFF-8AFB - 4 44
+END
