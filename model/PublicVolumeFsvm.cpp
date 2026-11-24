@@ -190,10 +190,16 @@ void PublicVolume::removeRange() {
 
 status_t PublicVolume::checkInVm() {
     mVmFailed = false;
+    mWaitingForPlace = false;
     if (mInVm) {
         // The filesystem check runs in the VM, after the mount and outside vold's lock (fsvmd fs.rs Checker), with the
         // fsck_msdos and fsck.exfat vold ran here before. Not with the same arguments: the VM checks a volume only
         // when it is marked dirty, and serves it read-only until the check passed.
+        if (mPart.waitingForPlace) {
+            // The disk's probe waits for a protected VM place (Disk::waitForPlaceDisk reads it again then).
+            mWaitingForPlace = true;
+            return -EAGAIN;
+        }
         if (mPart.unread) {
             LOG(ERROR) << getId() << ": the filesystem VM could not read this disk";
             mVmFailed = true;

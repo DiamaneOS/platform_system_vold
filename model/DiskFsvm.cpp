@@ -173,6 +173,15 @@ bool Disk::createPrivateVolumeInVm(const fsvm::Part& part) {
     return true;
 }
 
+void Disk::createWaitingVolume() {
+    mJustPartitioned = false;
+    fsvm::Part whole;
+    whole.length = mSize / 512;
+    whole.unread = true;
+    whole.waitingForPlace = true;
+    createPublicVolumeInVm(whole);
+}
+
 void Disk::createUnopenableVolume() {
     // Not "unsupported, format it?": one volume that cannot be opened, and says so.
     mJustPartitioned = false;
@@ -470,12 +479,12 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     status_t probed = kernelScans ? -EIO : fsvm::DeleteAllPartitions(mDevPath, mSysPath);
     if (probed == OK) probed = fsvm::Probe(mDevPath, mSize, &layout);
     if (probed == -EAGAIN) {
-        // No protected VM place: the disk shows as one that could not be opened yet and is read as soon as a place is
-        // free, never shared with another drive's VM and never given up.
+        // No protected VM place: the disk's placeholder says it waits for one (VOLUME_STATE_WAITING_FOR_PLACE) and the
+        // disk is read as soon as a place is free, never shared with another drive's VM and never given up.
         LOG(WARNING) << mId << ": waiting for a protected VM place to read the disk";
         mProbeFailed = true;
         mWaitingForPlace = true;
-        createUnopenableVolume();
+        createWaitingVolume();
         waitForPlaceDisk(getId());
         auto listener = VolumeManager::Instance()->getListener();
         if (listener) listener->onDiskScanned(getId());

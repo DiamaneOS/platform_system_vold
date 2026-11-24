@@ -189,6 +189,8 @@ interface IVold {
     const int VOLUME_STATE_UNOPENABLE = 9;
     /* DiamaneOS: unmounted, but the filesystem VM could not write everything back to it first */
     const int VOLUME_STATE_NOT_WRITTEN_BACK = 10;
+    // DiamaneOS: no protected VM place is free for the volume, it is mounted as soon as one is
+    const int VOLUME_STATE_WAITING_FOR_PLACE = 11;
 
     const int VOLUME_TYPE_PUBLIC = 0;
     const int VOLUME_TYPE_PRIVATE = 1;
