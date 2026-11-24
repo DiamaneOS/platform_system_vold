@@ -90,7 +90,7 @@ static int OpenObb(const std::string& path, userid_t ownerUser, struct stat* st)
     static constexpr char kCard[] = "/mnt/media_rw/";
     std::string root;
     std::vector<std::string> parts;
-    pid_t cardFsvmd = -1;
+    std::shared_ptr<PublicVolume> card;
     if (android::base::StartsWith(path, kData)) {
         parts = android::base::Split(path.substr(sizeof(kData) - 1), "/");
         // The owner's storage, or the storage of the user it shares storage with (a clone profile).
@@ -112,7 +112,7 @@ static int OpenObb(const std::string& path, userid_t ownerUser, struct stat* st)
                    (v.getMountUserId() == ownerUser || (shared != USER_UNKNOWN && v.getMountUserId() == shared));
         });
         if (!vol) return -EINVAL;
-        cardFsvmd = std::static_pointer_cast<PublicVolume>(vol)->getFsvmdPid();
+        card = std::static_pointer_cast<PublicVolume>(vol);
         // Below the volume's root: the component before Android/obb is the root itself.
         parts[0] = ".";
     } else {
@@ -125,9 +125,10 @@ static int OpenObb(const std::string& path, userid_t ownerUser, struct stat* st)
     std::string rel = android::base::Join(
             std::vector<std::string>(parts.begin() + (parts[0] == "." ? 1 : 0), parts.end()), "/");
     // On a card every step below is a request to the card's fsvmd, under vold's lock: a card that does not answer
-    // within kCardOpenMs has its fsvmd stopped (the card ends unopenable), which fails the steps at once.
-    std::optional<fsvm::Guard> guard;
-    if (cardFsvmd > 0) guard.emplace(cardFsvmd, kCardOpenMs);
+    // within kCardOpenMs has its FUSE connection ended (the card's volume ends unopenable), which fails the steps at
+    // once.
+    std::unique_ptr<fsvm::Guard> guard;
+    if (card) guard = card->guardInVm(kCardOpenMs);
     android::base::unique_fd dir(TEMP_FAILURE_RETRY(open(root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC)));
     if (dir < 0) return -errno;
     struct open_how how = {};

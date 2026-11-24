@@ -28,6 +28,7 @@
 #include "VolumeBase.h"
 #include "VolumeManager.h"
 #include "fs/Fsvm.h"
+#include "fs/FsvmDrive.h"
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -59,6 +60,7 @@ bool Disk::isVmDisk() const {
 void Disk::prepareStopAll() {
     // Every volume of the disk starts writing back at once, before they are stopped one after the other under vold's
     // lock: each later stop then finds its fsvmd done, and the whole disk keeps to one volume's time.
+    if (mDrive) mDrive->requestWriteBack();
     for (const auto& vol : mVolumes) vol->prepareStop();
 }
 
@@ -96,6 +98,8 @@ void Disk::beforeDestroyInVm() {
 void Disk::dropOldMedium() {
     LOG(WARNING) << mId << ": the medium changed, the old one's volumes are cut off before they stop";
     fsvm::FailRangesOf(mDevice);
+    // All its ranges fail at once, and its one VM ends without writing back.
+    if (mDrive) mDrive->kill();
     for (const auto& vol : mVolumes) {
         // A VM disk's public volumes are all PublicVolume (createPublicVolumeInVm).
         if (vol->getType() == VolumeBase::Type::kPublic) static_cast<PublicVolume*>(vol.get())->dropMedium();
@@ -107,18 +111,23 @@ void Disk::removeRanges() {
         fsvm::DeleteRange(name, "/dev/block/vold/" + name);
     }
     mRanges.clear();
+    // Its volumes are gone: an eject, a removal, a new read of the table. Its VM goes with them.
+    if (mDrive) mDrive->end();
+    mDrive.reset();
 }
 
 bool Disk::createPublicVolumeInVm(const fsvm::Part& part) {
-    // A crafted table can list many FAT partitions. Each served one holds a VM.
-    static constexpr int kMaxPublicPerDisk = 4;
-    if (mPublicVolumes >= kMaxPublicPerDisk) {
+    if (mPublicVolumes >= static_cast<int>(kMaxPublicPerDisk)) {
         LOG(WARNING) << mId << ": not serving partition " << part.index << ", " << kMaxPublicPerDisk
                      << " public volumes on this disk already";
         return false;
     }
     mPublicVolumes++;
-    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(mDevice, mDevPath, mSysPath, mSize, part));
+    // A placeholder (unread, waiting) is never served: no drive.
+    auto drive = part.unread ? nullptr : mDrive;
+    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(mDevice, mDevPath, mSysPath, mSize, part, drive));
+    // Its disk is known to its format too (a format whose outcome is not read back has the disk read again).
+    vol->setDiskId(getId());
     if (mJustPartitioned) {
         LOG(DEBUG) << "Device just partitioned; silently formatting";
         vol->setSilent(true);
@@ -129,7 +138,6 @@ bool Disk::createPublicVolumeInVm(const fsvm::Part& part) {
     }
 
     mVolumes.push_back(vol);
-    vol->setDiskId(getId());
     vol->create();
     return true;
 }
@@ -261,13 +269,17 @@ static void EnsurePlaceHooks() {
     std::thread([] {
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
-            bool waiting;
+            bool volumes, disks;
             {
                 std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
                 PruneWaiting();
-                waiting = !sWaitingVolumes.empty() || !sWaitingDisks.empty();
+                volumes = !sWaitingVolumes.empty();
+                disks = !sWaitingDisks.empty();
             }
-            if (waiting && fsvm::RoomForDrive() && !sPlaceRetryScheduled.exchange(true)) RetryWaitingForPlace();
+            // Each by its own VM's size: a disk's probe takes less than a drive's smallest serving VM.
+            const bool room = (disks && fsvm::RoomForVm(fsvm::kProbeVmMib)) ||
+                              (volumes && fsvm::RoomForVm(fsvm::kServeVmMib));
+            if (room && !sPlaceRetryScheduled.exchange(true)) RetryWaitingForPlace();
         }
     }).detach();
     fsvm::SetPlaceHooks([] { return ObbVolume::stopOneForDrive(); },
@@ -357,9 +369,11 @@ void Disk::reprobeInVm(Reprobe why) {
             return;
         case Reprobe::kFailedProbe:
         case Reprobe::kMountRetry:
+        case Reprobe::kAfterFormat:
             break;
     }
     if (why == Reprobe::kMountRetry) mMountRetryPending = false;
+    if (why == Reprobe::kAfterFormat) mRecheckPending = false;
     // Only while nothing of the disk is mounted, and (a failed probe) it still shows the result of that probe or
     // (a failed mount) a volume still could not be opened. The new volumes are mounted by the framework, as at
     // insertion.
@@ -371,8 +385,10 @@ void Disk::reprobeInVm(Reprobe why) {
     if (why == Reprobe::kFailedProbe && !mProbeFailed) return;
     if (why == Reprobe::kMountRetry && !unopenable) return;
     LOG(INFO) << mId << ": reading the partition table again"
-              << (why == Reprobe::kMountRetry ? " to mount it again" : "");
-    mForceProbe = why == Reprobe::kMountRetry;
+              << (why == Reprobe::kMountRetry    ? " to mount it again"
+                  : why == Reprobe::kAfterFormat ? " after a format whose outcome was not read back"
+                                                 : "");
+    mForceProbe = why == Reprobe::kMountRetry || why == Reprobe::kAfterFormat;
     readPartitions();
     mForceProbe = false;
 }
@@ -386,6 +402,14 @@ void Disk::retryMountLater() {
     int delay = kDelays[mMountRetries++];
     LOG(INFO) << mId << ": mounting again in " << delay << " s";
     ScheduleReprobe(getId(), delay, Reprobe::kMountRetry);
+}
+
+void Disk::recheckAfterFormat() {
+    // The disk is read again (a new probe) once the format's volume is no longer in use: what is on the medium now
+    // decides what the volume shows, and nothing offers to format it again on a guess.
+    if (mRecheckPending) return;
+    mRecheckPending = true;
+    ScheduleReprobe(getId(), 3, Reprobe::kAfterFormat);
 }
 
 void Disk::noteMounted() {
@@ -540,6 +564,9 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
             }
         }
         mVerdictPending = false;
+        // One VM for all public partitions of the drive, each a disk of it: all of them given at its start.
+        mDrive = std::make_shared<fsvm::Drive>(mDevice, mDevPath, getId(), mSize);
+        mDrive->setParts(fsvm::DriveParts(layout, static_cast<uint32_t>(maxMinors), kMaxPublicPerDisk));
         bool skipped = false;
         for (const auto& part : layout.parts) {
             switch (part.cls) {
