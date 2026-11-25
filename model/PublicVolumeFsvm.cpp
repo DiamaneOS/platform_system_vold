@@ -24,10 +24,8 @@
 #include "Disk.h"
 #include "Utils.h"
 #include "VolumeManager.h"
-#include "fs/Exfat.h"
 #include "fs/Fsvm.h"
 #include "fs/FsvmDrive.h"
-#include "fs/Vfat.h"
 
 #include <android-base/logging.h>
 #include <android-base/unique_fd.h>
@@ -238,18 +236,9 @@ status_t PublicVolume::checkInVm() {
             mVmFailed = true;
             return -EIO;
         }
-    } else if (mFsType == "vfat") {
-        // A volume on a partition device of its own (a virtual disk): fsck runs here, in its own sandbox
-        // (fsck_untrusted), as stock.
-        if (vfat::Check(mDevPath)) {
-            LOG(ERROR) << getId() << " failed filesystem check";
-            return -EIO;
-        }
-    } else if (mFsType == "exfat") {
-        if (exfat::Check(mDevPath)) {
-            LOG(ERROR) << getId() << " failed filesystem check";
-            return -EIO;
-        }
+    } else if (mFsType == "vfat" || mFsType == "exfat") {
+        // A volume on a partition device of its own (a virtual disk): its own VM checks it after the mount, as a
+        // card's VM does (serveInVm), and serves it read-only until the check passed. Nothing parses it here.
     } else {
         LOG(ERROR) << getId() << " unsupported filesystem " << mFsType;
         mVmFailed = true;
