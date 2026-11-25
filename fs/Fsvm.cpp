@@ -164,8 +164,6 @@ static constexpr uint64_t kVmExtraMiB = 4 + 6;
  * the pool. Its smallest are kProbeVmMib and kServeVmMib (PROBE_MIB and MIN_SERVE_MIB): a volume's VM may be larger,
  * and falls back to the smallest serving VM when that does not start. */
 static constexpr uint64_t kMaxVmMiB = 204;
-/* The pieces one VM may hold (kernel GUNYAH_LEND_MAX_PIECES): a VM that would take more never starts. */
-static constexpr uint64_t kVmMaxPieces = 20000;
 
 uint64_t ObbVmMib(uint64_t diskBytes) {
     // fsvmd main.rs obb_memory_mib: the probe VM's size up to 2 GiB, a serving VM's least above.
@@ -186,14 +184,10 @@ static bool ReadPoolValue(const char* name, uint64_t* value) {
     return android::base::ParseUint(android::base::Trim(text), value);
 }
 
-/* The pieces an ordinary-memory VM of `mib` MiB is likely to take: about one per two pages once free memory is
- * scattered, plus its firmware region and bounce buffers (1024 and 1536 pages at most). A hint only. */
-static uint64_t OrdinaryPieces(uint64_t mib) {
-    return mib * 256 / 2 + 1024 + 1536;
-}
-
-/* Whether a VM of `mib` MiB may start now, and why not in `why`. A kernel without the pool or its piece count leaves
- * the decision to the start itself. */
+/* Whether a VM of `mib` MiB may start now, and why not in `why`: room in the pool, or else ordinary memory while the
+ * kernel's real count of pieces of all VMs has room. The kernel makes an ordinary-memory VM's file in large blocks,
+ * counts its pieces and refuses it when they pass vm_pieces_max, and a VM refused at its start waits for room like
+ * one refused here. A kernel without the pool or its piece count leaves the decision to the start itself. */
 static bool RoomFor(uint64_t mib, std::string* why) {
     uint64_t freeBytes = 0, reserved = 0, pieces = 0, max = 0;
     const bool pool = ReadPoolValue("free_bytes", &freeBytes);
@@ -202,11 +196,9 @@ static bool RoomFor(uint64_t mib, std::string* why) {
     freeBytes = freeBytes > reserved ? freeBytes - reserved : 0;
     if (pool && freeBytes >= (mib + kVmExtraMiB) << 20) return true;
     if (!ReadPoolValue("vm_pieces", &pieces) || !ReadPoolValue("vm_pieces_max", &max)) return true;
-    const uint64_t need = OrdinaryPieces(mib);
-    if (need <= kVmMaxPieces && pieces + need <= max) return true;
+    if (pieces < max) return true;
     *why = "the pool has " + std::to_string(freeBytes >> 20) + " MiB free of " + std::to_string(mib + kVmExtraMiB) +
-           " MiB needed, and ordinary memory would take about " + std::to_string(need) + " pieces with " +
-           std::to_string(pieces) + " of " + std::to_string(max) + " in use";
+           " MiB needed, and all VMs hold " + std::to_string(pieces) + " of " + std::to_string(max) + " pieces";
     return false;
 }
 /* A drive waits for room: OBB images then never take room before it. */
