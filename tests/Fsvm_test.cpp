@@ -298,9 +298,9 @@ TEST(FsvmTest, DriveMemoryAsFsvmdSizesIt) {
     EXPECT_EQ(113u, DriveMemoryMib({DrivePart(1, "vfat", 1 << 20), DrivePart(2, "", 0)}));
     EXPECT_EQ(112u, DriveMemoryMib({DrivePart(1, "", 0), DrivePart(2, "", 0)}));
     std::vector<Part> large(4, DrivePart(1, "vfat", 256ULL << 20));
-    EXPECT_EQ(256u, DriveMemoryMib(large));
+    EXPECT_EQ(204u, DriveMemoryMib(large));
     std::vector<Part> huge(4, DrivePart(1, "exfat", UINT64_MAX));
-    EXPECT_EQ(256u, DriveMemoryMib(huge));
+    EXPECT_EQ(204u, DriveMemoryMib(huge));
 }
 
 // The drive's VM gets the public partitions Disk makes volumes of, never a damaged one, never more than its cap.
@@ -521,15 +521,17 @@ TEST(FsvmTest, AdmissionSizesAsFsvmd) {
     EXPECT_EQ(std::vector<uint64_t>({96}), DriveVmMib({DrivePart(1, "vfat", 1 << 20)}));
     EXPECT_EQ(std::vector<uint64_t>({144, 96}), DriveVmMib({DrivePart(1, "vfat", 64 << 20)}));
     std::vector<Part> large(4, DrivePart(1, "vfat", 256ULL << 20));
-    EXPECT_EQ(std::vector<uint64_t>({256, 96}), DriveVmMib(large));
+    EXPECT_EQ(std::vector<uint64_t>({204, 96}), DriveVmMib(large));
     EXPECT_EQ(64u, ObbVmMib(2ULL << 30));
     EXPECT_EQ(96u, ObbVmMib((2ULL << 30) + 512));
-    EXPECT_EQ(256u, RepairVmMib("vfat", 0));
+    // Every VM of vold's fits beside the decode service's VM: 512 MiB pool, 298 MiB of it the decode VM's, 10 for
+    // this VM's firmware region and bounce buffers.
+    EXPECT_EQ(204u, RepairVmMib("vfat", 0));
     EXPECT_EQ(144u, RepairVmMib("vfat", 64 << 20));
     EXPECT_EQ(96u, RepairVmMib("vfat", 1 << 20));
     EXPECT_EQ(145u, RepairVmMib("exfat", 65 << 20));
-    EXPECT_EQ(256u, RepairVmMib("exfat", UINT64_MAX));
-    EXPECT_EQ(224u, RepairVmMib("vfat", UINT64_MAX));
+    EXPECT_EQ(204u, RepairVmMib("exfat", UINT64_MAX));
+    EXPECT_EQ(204u, RepairVmMib("vfat", UINT64_MAX));
 }
 
 // H4: a partition's ID and node come only from the disk's own minors, and a node left for another device goes.

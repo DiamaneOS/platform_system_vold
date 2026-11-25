@@ -206,7 +206,7 @@ int WaitDriveRepair(pid_t token);
 
 /*
  * VM memory for one drive's VM serving `parts`, as fsvmd sizes it (fsvm proto layout.rs drive_memory_mib): the
- * largest partition's own serving VM, plus for each other one 16 MiB and its metadata share, 96 to 256 MiB.
+ * largest partition's own serving VM, plus for each other one 16 MiB and its metadata share, 96 to 204 MiB.
  */
 uint64_t DriveMemoryMib(const std::vector<Part>& parts);
 

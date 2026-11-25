@@ -58,7 +58,7 @@ static pid_t sNextRepair = -2;
 
 /* fsvm proto layout.rs: MIN_SERVE_MIB, MAX_SERVE_MIB, DRIVE_PART_MIB and serve_memory_mib. */
 static constexpr uint64_t kMinServeMiB = 96;
-static constexpr uint64_t kMaxServeMiB = 256;
+static constexpr uint64_t kMaxServeMiB = 204;
 static constexpr uint64_t kDrivePartMiB = 16;
 
 static uint64_t MetaMiB(const Part& p) {
