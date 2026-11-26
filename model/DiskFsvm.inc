@@ -46,7 +46,16 @@
         kMountRetry,
         /* the VM found nothing it can read: a second VM must answer the same before a format is offered */
         kConfirm,
+        /* the probe found no protected VM place free, and one is free now */
+        kPlace,
     };
+    /* A volume (by ID) or a disk's probe waits for a protected VM place: tried again whenever one is given back.
+     * With vold's lock held. */
+    static void waitForPlace(const std::string& volumeId);
+    static void waitForPlaceDisk(const std::string& diskId);
+    /* Makes the volumes that wait for a place again, so that the framework mounts them, as at insertion (a mount
+     * vold started itself would have no callback to hand MediaProvider the FUSE descriptor) */
+    void remakeWaitingVolumes();
     /* Reads the table again, later, when it is still worth it (DiskFsvm.cpp) */
     void reprobeInVm(Reprobe why);
     /* A volume of the disk failed to mount in its VM: the volumes are made again later, and the framework mounts them */
@@ -54,6 +63,8 @@
     /* A volume of the disk mounted: later failures get their retries again */
     void noteMounted();
   private:
+    /* The probe found no protected VM place free: the placeholder shows, and the disk is read when one is free */
+    bool mWaitingForPlace = false;
     bool mForceProbe = false;
     int mMountRetries = 0;
     bool mMountRetryPending = false;

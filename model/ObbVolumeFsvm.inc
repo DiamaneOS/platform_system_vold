@@ -24,6 +24,9 @@
     const std::string& getSourcePath() const { return mSourcePath; }
     /* Asks its fsvmd to stop now, so that several OBB VMs end together (VolumeManager::unmountObbsBelow) */
     void requestStop();
+    /* Stops the VM of the OBB image mounted last, for a drive that needs its place (vold's lock is held). Whether one
+     * stopped. */
+    static bool stopOneForDrive();
 
   private:
     /* The caller's user (the constructor's `user`) */

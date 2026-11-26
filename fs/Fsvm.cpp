@@ -146,15 +146,89 @@ static std::map<pid_t, std::string> sSlotOf;
 /* A repair's pipe, from StartRepair to WaitRepair. Under sChildrenLock. */
 static std::map<pid_t, unique_fd> sRepairPipes;
 
+/*
+ * Room for a protected VM. The hypervisor refuses a VM at its start when the pieces of memory lent and shared by all
+ * running VMs together pass its budget. The kernel keeps that total (vm_pieces) and refuses a lend that would pass
+ * vm_pieces_max, the budget's one setting, before the hypervisor sees it. A VM whose memory comes from the boot pool
+ * costs a few pieces, one on ordinary memory thousands. So a VM of vold's starts when the pool has room for it, or when
+ * the pieces left could hold it on ordinary memory: the kernel then decides with the real count, and fsvmd reports a
+ * VM refused at its start as kExitNoRoom. Read in Spawn under vold's lock, so a drive and an OBB image never race.
+ */
+static constexpr const char* kPoolDir = "/sys/class/misc/gunyah_vm_pool/";
+/* What a VM of vold's takes from the pool besides its RAM: the firmware region and its bounce buffers. */
+static constexpr uint64_t kVmExtraMiB = 4 + 6;
+/* fsvmd's VM sizes (fsvm proto layout.rs PROBE_MIB and MIN_SERVE_MIB): a probe or an OBB image, and a volume. A
+ * volume's VM may be larger, and falls back to the smallest serving VM when that does not start. */
+static constexpr uint64_t kSmallVmMiB = 64;
+static constexpr uint64_t kVolumeVmMiB = 96;
+
+static bool ReadPoolValue(const char* name, uint64_t* value) {
+    std::string text;
+    if (!android::base::ReadFileToString(std::string(kPoolDir) + name, &text)) return false;
+    return android::base::ParseUint(android::base::Trim(text), value);
+}
+
+/* The pieces an ordinary-memory VM of `mib` MiB is likely to take: about one per two pages once free memory is
+ * scattered, plus its firmware region and bounce buffers (1024 and 1536 pages at most). A hint only. */
+static uint64_t OrdinaryPieces(uint64_t mib) {
+    return std::min<uint64_t>(20000, mib * 256 / 2 + 1024 + 1536);
+}
+
+/* Whether a VM of `mib` MiB may start now, and why not in `why`. A kernel without the pool or its piece count leaves
+ * the decision to the start itself. */
+static bool RoomFor(uint64_t mib, std::string* why) {
+    uint64_t freeBytes = 0, pieces = 0, max = 0;
+    const bool pool = ReadPoolValue("free_bytes", &freeBytes);
+    if (pool && freeBytes >= (mib + kVmExtraMiB) << 20) return true;
+    if (!ReadPoolValue("vm_pieces", &pieces) || !ReadPoolValue("vm_pieces_max", &max)) return true;
+    const uint64_t need = OrdinaryPieces(mib);
+    if (pieces + need <= max) return true;
+    *why = "the pool has " + std::to_string(freeBytes >> 20) + " MiB free of " + std::to_string(mib + kVmExtraMiB) +
+           " MiB needed, and ordinary memory would take about " + std::to_string(need) + " pieces with " +
+           std::to_string(pieces) + " of " + std::to_string(max) + " in use";
+    return false;
+}
+/* A drive waits for room: OBB images then never take room before it. */
+static std::atomic<bool> sDrivesWait{false};
+static std::function<bool()> sStopObbForDrive;
+static std::function<void()> sOnPlaceFree;
+
+/* After a slot was given back: the waiting volumes and disks get their turn (outside sChildrenLock). */
+static void PlaceFree() {
+    if (sOnPlaceFree) sOnPlaceFree();
+}
+
+/* fsvmd `rc` ended because its VM was refused for want of memory: a drive's VM stops one OBB image's VM, so that the
+ * drive's retry finds the room (the stop gives the place back, and the waiting volumes get their turn). */
+static bool RefusedForRoom(int rc, bool drive) {
+    if (rc != kExitNoRoom) return false;
+    if (drive && sStopObbForDrive) sStopObbForDrive();
+    return true;
+}
+
 /* Drops fsvmd `pid` from the tables after its end was read elsewhere (WaitRepair): its connection, and its slot. */
 static void Forget(pid_t pid) {
-    std::lock_guard<std::mutex> lock(sChildrenLock);
-    sChildren.erase(pid);
-    auto slot = sSlotOf.find(pid);
-    if (slot != sSlotOf.end()) {
+    {
+        std::lock_guard<std::mutex> lock(sChildrenLock);
+        sChildren.erase(pid);
+        auto slot = sSlotOf.find(pid);
+        if (slot == sSlotOf.end()) return;
         sBusySlots.erase(slot->second);
         sSlotOf.erase(slot);
     }
+    PlaceFree();
+}
+
+/* Gives fsvmd `pid`'s slot back once it ended, and with it its place in the hypervisor. */
+static void FreeSlotOf(pid_t pid) {
+    {
+        std::lock_guard<std::mutex> lock(sChildrenLock);
+        auto slot = sSlotOf.find(pid);
+        if (slot == sSlotOf.end()) return;
+        sBusySlots.erase(slot->second);
+        sSlotOf.erase(slot);
+    }
+    PlaceFree();
 }
 
 /* Reads one answer of the service within `ms`: P <pid>, X <status> or E <errno>. */
@@ -268,6 +342,25 @@ static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int f
     const bool obb = !args.empty() && args[0] == "--obb";
     const char* const* slots = probe ? kProbeSlots : obb ? kObbSlots : kVolumeSlots;
     size_t n = probe ? std::size(kProbeSlots) : obb ? std::size(kObbSlots) : std::size(kVolumeSlots);
+    // Room first. An OBB image is the lowest priority: it never stops anything. A drive's VM (probe, format, volume,
+    // repair) stops one OBB image's VM when the room it needs is missing, never the decode service's or another
+    // drive's.
+    const uint64_t mib = probe || obb ? kSmallVmMiB : kVolumeVmMiB;
+    if (obb && sDrivesWait) {
+        LOG(WARNING) << "fsvm: no protected VM place for an OBB image: a drive waits for room, and OBB images come last";
+        errno = EAGAIN;
+        return -1;
+    }
+    for (int tries = 0;; tries++) {
+        std::string why;
+        if (RoomFor(mib, &why)) break;
+        if (!obb && tries < 2 && sStopObbForDrive && sStopObbForDrive()) continue;
+        LOG(WARNING) << "fsvm: no protected VM place for "
+                     << (probe ? "a probe or format" : obb ? "an OBB image" : "a volume") << ": " << why
+                     << (obb ? ", and OBB images come last" : "");
+        errno = EAGAIN;
+        return -1;
+    }
     for (size_t i = 0; i < n; i++) {
         {
             std::lock_guard<std::mutex> lock(sChildrenLock);
@@ -314,23 +407,26 @@ static int Reap(pid_t pid, int waitMs, int termMs) {
         if (it == sChildren.end()) return -1;
         conn = std::move(it->second);
         sChildren.erase(it);
-        // The service ends with its fsvmd: the slot is free for the next start.
-        auto slot = sSlotOf.find(pid);
-        if (slot != sSlotOf.end()) {
-            sBusySlots.erase(slot->second);
-            sSlotOf.erase(slot);
-        }
     }
+    // The service ends with its fsvmd: its slot, and its VM's place, are free once fsvmd ended (FreeSlotOf), not
+    // before, so that no new VM starts while this one still holds its place.
     char kind = 0;
     uint64_t value = 0;
-    if (ReadAnswer(conn.get(), waitMs, &kind, &value) && kind == 'X') return static_cast<int>(value);
+    if (ReadAnswer(conn.get(), waitMs, &kind, &value) && kind == 'X') {
+        FreeSlotOf(pid);
+        return static_cast<int>(value);
+    }
     if (termMs > 0) {
         Tell(conn.get(), 'T');
-        if (ReadAnswer(conn.get(), termMs, &kind, &value) && kind == 'X') return static_cast<int>(value);
+        if (ReadAnswer(conn.get(), termMs, &kind, &value) && kind == 'X') {
+            FreeSlotOf(pid);
+            return static_cast<int>(value);
+        }
     }
     Tell(conn.get(), 'K');
     // The service reaps it at once, and closing the connection kills it in any case.
     ReadAnswer(conn.get(), kKillMs, &kind, &value);
+    FreeSlotOf(pid);
     return -1;
 }
 
@@ -508,7 +604,7 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
                         dev.get(), -1, wr.get());
     if (child < 0) {
         LOG(ERROR) << "fsvm: fsvmd did not start for " << diskPath;
-        return -EIO;
+        return errno == EAGAIN ? -EAGAIN : -EIO;
     }
     wr.reset();
     dev.reset();
@@ -516,6 +612,10 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
     int readMs = timeoutMs > 0 ? std::min(timeoutMs, kProbeTimeoutMs) : kProbeTimeoutMs;
     status_t res = ReadAll(rd.get(), NowMs() + readMs, kMaxProbeOutput, &text);
     int rc = Reap(child, res == OK ? kVmEndMs : 0, 0);
+    if (RefusedForRoom(rc, true)) {
+        LOG(WARNING) << "fsvm: no protected VM place for the probe of " << diskPath << ": its VM was refused at its start";
+        return -EAGAIN;
+    }
     // -1: answered, then stopped while its VM was still ending. Any other exit status is a failure.
     if (res != OK || (rc != 0 && rc != -1)) {
         LOG(ERROR) << "fsvm: the filesystem VM did not read " << diskPath << " (" << res << ", exit " << rc << ")";
@@ -558,7 +658,7 @@ status_t Format(const std::string& path, const std::string& fsType, dev_t disk, 
                         dev.get(), -1, wr.get());
     if (child < 0) {
         LOG(ERROR) << "fsvm: fsvmd did not start to format " << path;
-        return -EIO;
+        return errno == EAGAIN ? -EAGAIN : -EIO;
     }
     wr.reset();
     dev.reset();
@@ -566,7 +666,11 @@ status_t Format(const std::string& path, const std::string& fsType, dev_t disk, 
     status_t res = ReadAll(rd.get(), NowMs() + kFormatTimeoutMs, 16, &text);
     // The VM answers OK only after the format and a sync of the disk (fsvm_guest.c do_format).
     const bool done = res == OK && text == "OK\n";
-    int rc = Reap(child, done ? kVmEndMs : 0, 0);
+    int rc = Reap(child, res == OK ? kVmEndMs : 0, 0);
+    if (RefusedForRoom(rc, true)) {
+        LOG(WARNING) << "fsvm: no protected VM place to format " << path << ": its VM was refused at its start";
+        return -EAGAIN;
+    }
     if (!done || (rc != 0 && rc != -1)) {
         LOG(ERROR) << "fsvm: the filesystem VM did not format " << path << " (" << res << ", exit " << rc << ")";
         return -EIO;
@@ -679,9 +783,13 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
         }
         return OK;
     }
-    LOG(ERROR) << "fsvm: the filesystem VM did not serve " << v.volumeId << ", not mounting it";
-    Stop(child, false);
+    int rc = Stop(child, false);
     umount2(v.target.c_str(), MNT_DETACH);
+    if (RefusedForRoom(rc, !v.obb)) {
+        LOG(WARNING) << "fsvm: no protected VM place for " << v.volumeId << ": its VM was refused at its start";
+        return -EAGAIN;
+    }
+    LOG(ERROR) << "fsvm: the filesystem VM did not serve " << v.volumeId << ", not mounting it";
     return -EIO;
 }
 
@@ -814,6 +922,25 @@ bool ProbeMemory::took(const std::string& seq, uint64_t size, int64_t nowMs) {
 
 bool ProbeMemory::holds(const std::string& seq, uint64_t size) const {
     return !mProbed || (seq == mSeq && size == mSize);
+}
+
+void SetPlaceHooks(std::function<bool()> stopObbForDrive, std::function<void()> onPlaceFree) {
+    sStopObbForDrive = std::move(stopObbForDrive);
+    sOnPlaceFree = std::move(onPlaceFree);
+}
+
+void SetDrivesWaiting(bool waiting) {
+    sDrivesWait = waiting;
+}
+
+bool RoomForDrive() {
+    std::string why;
+    return RoomFor(kVolumeVmMiB, &why);
+}
+
+size_t PlacesInUse() {
+    std::lock_guard<std::mutex> lock(sChildrenLock);
+    return sBusySlots.size();
 }
 
 void Served(bool obb, bool starting) {

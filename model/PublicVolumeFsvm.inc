@@ -25,6 +25,9 @@
     PublicVolume(dev_t diskDevice, const std::string& diskDevPath, const std::string& diskSysPath,
                  uint64_t diskBytes, const fsvm::Part& part);
     void prepareStop() override;
+    bool waitingForPlace() const override { return mWaitingForPlace; }
+    /* What the filesystem VM read of the volume's partition (Disk::remakeWaitingVolumes) */
+    const fsvm::Part& partInVm() const { return mPart; }
     /* The disk's medium changed under the volume: its fsvmd goes now, without writing back */
     void dropMedium();
 
@@ -93,6 +96,8 @@
     uint64_t mDiskBytes = 0;
     /* Set when the last mount failed in the filesystem VM */
     bool mVmFailed = false;
+    /* The last mount found no protected VM place free (fsvm::Spawn): mounted again when one is free */
+    bool mWaitingForPlace = false;
     /* The partition's device-mapper range while its VM or a format uses it (dm name and vold's node) */
     std::string mRangeName;
     std::string mRangeNode;
