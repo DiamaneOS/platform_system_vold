@@ -26,6 +26,7 @@
 #include "VolumeManager.h"
 #include "fs/Exfat.h"
 #include "fs/Fsvm.h"
+#include "fs/FsvmDrive.h"
 #include "fs/Vfat.h"
 
 #include <android-base/logging.h>
@@ -48,7 +49,7 @@ namespace android {
 namespace vold {
 
 PublicVolume::PublicVolume(dev_t diskDevice, const std::string& diskDevPath, const std::string& diskSysPath,
-                           uint64_t diskBytes, const fsvm::Part& part)
+                           uint64_t diskBytes, const fsvm::Part& part, std::shared_ptr<fsvm::Drive> drive)
     : VolumeBase(Type::kPublic), mDevice(diskDevice) {
     // The ID the kernel's partition device had, as before phase 2.
     setId(StringPrintf("public:%u,%u", major(diskDevice), minor(diskDevice) + part.index));
@@ -60,6 +61,7 @@ PublicVolume::PublicVolume(dev_t diskDevice, const std::string& diskDevPath, con
     mDiskDevPath = diskDevPath;
     mDiskSysPath = diskSysPath;
     mDiskBytes = diskBytes;
+    mDrive = std::move(drive);
 }
 
 status_t PublicVolume::readMetadataInVm() {
@@ -74,47 +76,49 @@ status_t PublicVolume::readMetadataInVm() {
 
 status_t PublicVolume::destroyInVm() {
     cancelRepairInVm();
-    removeRange();
     return OK;
 }
 
-pid_t PublicVolume::startRepairInVm(pid_t servingPid) {
-    if (servingPid != mFsvmdPid || getState() != State::kMounted || mRepairPid > 0) return -1;
-    // Nothing to write back: the volume was read-only since its mount.
+std::unique_ptr<fsvm::Guard> PublicVolume::guardInVm(int ms) const {
+    if (mDrive) return mAttached ? std::make_unique<fsvm::Guard>(mDrive->stuck(mPart), ms) : nullptr;
+    return mFsvmdPid > 0 ? std::make_unique<fsvm::Guard>(mFsvmdPid, ms) : nullptr;
+}
+
+pid_t PublicVolume::startRepairInVm(pid_t serving) {
+    if (serving != mServing || getState() != State::kMounted || mRepairPid != -1) return -1;
+    if (mDrive) {
+        // In its drive's VM, which stays while the partition is unmounted for the repair. Nothing to write back: the
+        // volume was read-only since its mount.
+        mDrive->holdForRepair();
+        unmount();
+        showChecking();
+        mRepairPid = mDrive->startRepair(mPart);
+        if (mRepairPid == -1) {
+            mDrive->repairEnded();
+            showUnmounted();
+        }
+        return mRepairPid;
+    }
+    // A volume on a partition device of its own (a virtual disk): in a VM of its own, which sees it as a whole disk.
     unmount();
     showChecking();
     fsvm::Volume v;
-    std::string path;
-    const bool range = mPart.index > 0;
-    if (createRange(false, &path) != OK) {
-        showUnmounted();
-        return -1;
-    }
-    v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDWR | O_CLOEXEC)));
+    v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), O_RDWR | O_CLOEXEC)));
     v.blockSize = v.fd >= 0 ? fsvm::BlockSize(v.fd.get()) : 0;
-    if (v.fd < 0 || !v.blockSize || (!range && !fsvm::SameMedium(mDevice, mPart.diskSeq))) {
+    if (v.fd < 0 || !v.blockSize || GetBlockDevSize(v.fd.get(), &v.diskBytes) != OK || v.diskBytes < 512) {
         LOG(ERROR) << getId() << ": no disk for the repair";
-        removeRange();
         showUnmounted();
         return -1;
     }
-    v.part = mPart;
-    if (range) {
-        // The partition alone, as a disk of its own, as for the mount (serveInVm).
-        v.diskBytes = mPart.length * 512;
-        v.part.index = 0;
-        v.part.start = 0;
-    } else {
-        v.diskBytes = mDiskBytes;
-    }
+    v.diskBytes &= ~511ULL;
+    v.part.length = v.diskBytes / 512;
+    v.part.fsType = mFsType;
     v.gid = AID_MEDIA_RW;
     v.volumeId = getId();
     mRepairPid = fsvm::StartRepair(std::move(v));
     if (mRepairPid <= 0) {
         mRepairPid = -1;
-        removeRange();
         showUnmounted();
-        return -1;
     }
     return mRepairPid;
 }
@@ -123,7 +127,6 @@ void PublicVolume::endRepairInVm(pid_t repairPid, int rc) {
     // Stopped meanwhile (an eject or removal): nothing more.
     if (repairPid != mRepairPid) return;
     mRepairPid = -1;
-    removeRange();
     if (rc != 0) {
         LOG(ERROR) << getId() << ": the repair in the filesystem VM failed (" << rc << "), it stays read-only";
         mRepairFailed = true;
@@ -132,21 +135,26 @@ void PublicVolume::endRepairInVm(pid_t repairPid, int rc) {
     }
     showUnmounted();
     mount();
+    // After the mount, so that the drive's VM serves on when the partition is served again.
+    if (mDrive) mDrive->repairEnded();
 }
 
 bool PublicVolume::cancelRepairInVm() {
-    if (mRepairPid <= 0) return false;
+    if (mRepairPid == -1) return false;
     LOG(WARNING) << getId() << ": the repair stops, the volume keeps its dirty mark";
     pid_t pid = mRepairPid;
     mRepairPid = -1;
-    fsvm::Kill(pid);
-    removeRange();
+    if (mDrive) {
+        mDrive->cancelRepair(mPart);
+    } else {
+        fsvm::Kill(pid);
+    }
     showUnmounted();
     return true;
 }
 
 PublicVolume::UnmountInVm::UnmountInVm(PublicVolume* vol) : mVol(vol) {
-    if (mVol->mFsvmdPid > 0) mStuck = std::make_unique<fsvm::Guard>(mVol->mFsvmdPid, 15000);
+    mStuck = mVol->guardInVm(15000);
     VolumeManager::Instance()->unmountObbsBelow(mVol->getInternalPath());
 }
 
@@ -158,34 +166,6 @@ PublicVolume::UnmountInVm::~UnmountInVm() {
 void PublicVolume::UnmountInVm::fuseGone() {
     mStuck.reset();
     mVol->stopInVm();
-}
-
-status_t PublicVolume::createRange(bool readOnly, std::string* path) {
-    if (mPart.index == 0) {
-        // A filesystem on the whole disk: the disk holds nothing else.
-        *path = mDiskDevPath;
-        return OK;
-    }
-    // A range left from before (its VM still held it when it was to go) is removed first.
-    if (!mRangeName.empty()) removeRange();
-    // The VM, fsck and the format tools get exactly this partition's sectors, as a device-mapper range of the disk.
-    // Android's kernel reads nothing from it and adds no partition to the disk.
-    std::string name = fsvm::RangeName(mDevice, mPart.index);
-    status_t res = fsvm::CreateRange(name, mDevice, mPart.start, mPart.length, readOnly, &mRangeNode, nullptr,
-                                     mPart.diskSeq);
-    if (res != OK) return res;
-    mRangeName = name;
-    *path = mRangeNode;
-    return OK;
-}
-
-void PublicVolume::removeRange() {
-    if (mRangeName.empty()) return;
-    if (fsvm::DeleteRange(mRangeName, mRangeNode) != OK) {
-        LOG(WARNING) << getId() << ": range " << mRangeName << " still in use, left in place";
-    }
-    mRangeName.clear();
-    mRangeNode.clear();
 }
 
 status_t PublicVolume::checkInVm() {
@@ -245,15 +225,15 @@ status_t PublicVolume::checkInVm() {
     return OK;
 }
 
-void PublicVolume::onFsvmdExit(pid_t pid) {
-    if (pid != mFsvmdPid || getState() != State::kMounted) return;
+void PublicVolume::onFsvmdExit(pid_t serving) {
+    if (serving != mServing || getState() != State::kMounted) return;
     LOG(ERROR) << getId() << ": fsvmd ended on its own, the volume could not be served any more";
     unmount();
     setUnopenable();
 }
 
-void PublicVolume::onCheckDone(pid_t pid, char state) {
-    if (pid != mFsvmdPid || getState() != State::kMounted) return;
+void PublicVolume::onCheckDone(pid_t serving, char state) {
+    if (serving != mServing || getState() != State::kMounted) return;
     // The volume was reported read-only while the VM checked it (Mount, c): writable once the check passed.
     switch (state) {
         case 'W':
@@ -273,14 +253,15 @@ void PublicVolume::onCheckDone(pid_t pid, char state) {
             }
             LOG(WARNING) << getId() << ": the errors need a longer repair, the volume is taken from apps for it";
             // Outside the Watch thread and vold's lock: the repair has no time limit.
-            std::thread([id = getId(), pid] {
+            std::thread([id = getId(), serving] {
                 std::unique_lock<std::mutex> lock(VolumeManager::Instance()->getLock());
                 auto vol = VolumeManager::Instance()->findVolume(id);
                 if (!vol || vol->getType() != Type::kPublic) return;
-                pid_t repair = static_cast<PublicVolume*>(vol.get())->startRepairInVm(pid);
-                if (repair <= 0) return;
+                pid_t repair = static_cast<PublicVolume*>(vol.get())->startRepairInVm(serving);
+                if (repair == -1) return;
                 lock.unlock();
-                int rc = fsvm::WaitRepair(repair);
+                // A drive's repair token is never a pid (fsvm::Drive::startRepair).
+                int rc = repair < 0 ? fsvm::WaitDriveRepair(repair) : fsvm::WaitRepair(repair);
                 lock.lock();
                 vol = VolumeManager::Instance()->findVolume(id);
                 if (vol && vol->getType() == Type::kPublic) {
@@ -299,84 +280,67 @@ void PublicVolume::onCheckDone(pid_t pid, char state) {
 
 void PublicVolume::dropMedium() {
     // A card swapped in a USB reader: a write back would reach the new card at the old one's offsets. The disk has
-    // cut the ranges off already (fsvm::FailRangesOf), a whole-disk volume's VM holds the disk itself.
+    // cut the ranges off already (fsvm::FailRangesOf) and killed its drive's fsvmd (Disk::dropOldMedium).
+    if (mDrive) {
+        if (mAttached) mWriteBackFailed = true;
+        mAttached = false;
+        mServing = 0;
+        return;
+    }
     if (mFsvmdPid <= 0) return;
     LOG(WARNING) << getId() << ": the medium changed, its VM stops without writing back";
     fsvm::Kill(mFsvmdPid);
     fsvm::Served(false, false);
     mFsvmdPid = -1;
+    mServing = 0;
     mWriteBackFailed = true;
 }
 
+status_t PublicVolume::serveOnDrive(gid_t gid, bool* servedReadOnly) {
+    // One VM serves every public partition of the drive, each through a range of its own and a disk of its own in the
+    // VM, so that no partition's VM reaches another drive and a partition reaches no sector outside its range.
+    if (!mDrive || !mDrive->serves(mPart)) {
+        LOG(ERROR) << getId() << ": not a partition its drive's VM serves";
+        return -EIO;
+    }
+    // MediaProvider of the user the volume is mounted for owns its files: it sets their times when an app's write
+    // through /storage closes, which stock's FAT and exFAT drivers let group media_rw do (allow_utime).
+    pid_t serving = 0;
+    status_t res = mDrive->attach(mPart, gid, fsvm::MediaProviderUid(getMountUserId()), getId(), mRawPath, &serving,
+                                  servedReadOnly);
+    if (res != OK) return res;
+    mAttached = true;
+    mServing = serving;
+    return OK;
+}
+
 status_t PublicVolume::serveInVm(gid_t gid, bool* servedReadOnly) {
+    if (mInVm) return serveOnDrive(gid, servedReadOnly);
+    // A volume on a partition device of its own (a virtual disk): a VM of its own sees it as a whole disk.
     fsvm::Volume v;
-    std::string path = mInVm ? mDiskDevPath : mDevPath;
-    // A card with its write-protect switch on, as the kernel mount handled it: served read-only, through a
-    // read-only range.
-    bool readOnly = false;
-    if (mInVm) {
-        android::base::unique_fd probe(TEMP_FAILURE_RETRY(open(mDiskDevPath.c_str(), O_RDWR | O_CLOEXEC)));
-        readOnly = probe < 0 && (errno == EROFS || errno == EACCES);
+    v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), O_RDWR | O_CLOEXEC)));
+    if (v.fd < 0 && (errno == EROFS || errno == EACCES)) {
+        v.readOnly = true;
+        v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), O_RDONLY | O_CLOEXEC)));
     }
-    // A partition: its VM gets exactly its range, never the whole disk, so it cannot reach another partition or the
-    // adoptable storage next to it.
-    const bool range = mInVm && mPart.index > 0;
-    if (range) {
-        status_t res = createRange(readOnly, &path);
-        if (res != OK) {
-            LOG(ERROR) << getId() << ": no range of its own (" << res << ")";
-            return res;
-        }
-    }
-    v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC)));
-    if (v.fd < 0 && !readOnly && (errno == EROFS || errno == EACCES)) {
-        readOnly = true;
-        v.fd.reset(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
-    }
-    v.readOnly = readOnly;
     if (v.fd < 0) {
         int e = errno;
-        PLOG(ERROR) << getId() << ": opening " << path;
-        if (range) removeRange();
+        PLOG(ERROR) << getId() << ": opening " << mDevPath;
         return -e;
     }
     v.blockSize = fsvm::BlockSize(v.fd.get());
-    if (!v.blockSize) {
-        if (range) removeRange();
-        return -EINVAL;
-    }
-    // A whole-disk volume's VM gets the disk itself: only while it holds the medium the probe read (a range checks
-    // that as it is set up).
-    if (mInVm && !range && !fsvm::SameMedium(mDevice, mPart.diskSeq)) {
-        LOG(ERROR) << getId() << ": the medium changed since it was read, not serving it";
-        return -ENODEV;
-    }
-    if (range) {
-        // The partition alone, as a disk of its own: the filesystem starts at its first sector.
-        v.diskBytes = mPart.length * 512;
-        v.part = mPart;
-        v.part.index = 0;
-        v.part.start = 0;
-    } else if (mInVm) {
-        v.part = mPart;
-        v.diskBytes = mDiskBytes;
-    } else {
-        // A volume on a partition device of its own (a virtual disk): the VM sees it as a whole disk.
-        if (GetBlockDevSize(v.fd.get(), &v.diskBytes) != OK || v.diskBytes < 512) return -EIO;
-        v.diskBytes &= ~511ULL;
-        v.part.index = 0;
-        v.part.start = 0;
-        v.part.length = v.diskBytes / 512;
-        v.part.fsType = mFsType;
-    }
+    if (!v.blockSize || GetBlockDevSize(v.fd.get(), &v.diskBytes) != OK || v.diskBytes < 512) return -EIO;
+    v.diskBytes &= ~511ULL;
+    v.part.index = 0;
+    v.part.start = 0;
+    v.part.length = v.diskBytes / 512;
+    v.part.fsType = mFsType;
     v.gid = gid;
-    // MediaProvider of the user the volume is mounted for owns its files: it sets their times when an app's write
-    // through /storage closes, which stock's FAT and exFAT drivers let group media_rw do (allow_utime).
     v.ownerUid = fsvm::MediaProviderUid(getMountUserId());
     v.volumeId = getId();
     v.target = mRawPath;
     status_t res = fsvm::Mount(std::move(v), &mFsvmdPid, servedReadOnly);
-    if (res != OK && range) removeRange();
+    if (res == OK) mServing = mFsvmdPid;
     return res;
 }
 
@@ -415,6 +379,20 @@ int PublicVolume::guardMs() const {
 }
 
 void PublicVolume::stopInVm() {
+    if (mDrive) {
+        // Its FUSE mount is gone: the drive's fsvmd writes the partition back and unmounts it in the VM. The drive's
+        // VM ends with its last partition.
+        if (mAttached) {
+            int rc = mDrive->detach(mPart, true);
+            if (rc != 0) {
+                LOG(ERROR) << getId() << ": not everything may have been written back (" << rc << ")";
+                mWriteBackFailed = true;
+            }
+        }
+        mAttached = false;
+        mServing = 0;
+        return;
+    }
     if (mFsvmdPid > 0) {
         // Its FUSE mount is gone: fsvmd writes the volume back and unmounts it in the VM before it ends. When that
         // failed, or fsvmd had to be killed, the volume is not reported as safely unmounted.
@@ -426,7 +404,7 @@ void PublicVolume::stopInVm() {
         fsvm::Served(false, false);
     }
     mFsvmdPid = -1;
-    removeRange();
+    mServing = 0;
 }
 
 status_t PublicVolume::formatInVm(const std::string& fsType) {
@@ -454,43 +432,25 @@ status_t PublicVolume::formatInVm(const std::string& fsType) {
         LOG(ERROR) << "Unsupported filesystem " << fsType;
         return -EINVAL;
     }
-    std::string dev;
-    status_t res = createRange(false, &dev);
-    if (res != OK) {
-        LOG(ERROR) << getId() << " has no range to format";
-        return res;
-    }
-    if (WipeBlockDevice(dev) != OK) {
-        LOG(WARNING) << getId() << " failed to wipe";
-    }
-    // In the VM, as everything else that touches the volume's filesystem: no mkfs runs on Android.
-    res = fsvm::Format(dev, pick, mDevice, mPart.diskSeq);
-    removeRange();
-    if (res != OK) {
-        LOG(ERROR) << getId() << " failed to format";
+    if (!mDrive) {
+        LOG(ERROR) << getId() << ": no drive's VM to format it in";
         return -EIO;
     }
-    // The new filesystem has a new serial, so the UUID changes. The VM reads it again, as blkid did at mount. If it
-    // cannot say, the volume keeps the type just written (fsvmd checks it at mount) and has no UUID until then.
-    mPart.fsType = pick;
-    mPart.fsUuid.clear();
-    mPart.label.clear();
-    mPart.metaBytes = 0;
-    mPart.noFsConfirmed = false;
-    // One probe only, of at most 10 s: vold holds its lock for the wipe and the format already, and after a
-    // partitioning for the probe of the new table too.
-    fsvm::Layout layout;
-    if (fsvm::Probe(mDiskDevPath, mDiskBytes, &layout, 10000) == OK) {
-        for (const auto& p : layout.parts) {
-            if (p.index == mPart.index && p.start == mPart.start && p.length == mPart.length && p.fsType == pick) {
-                std::string seq = mPart.diskSeq;
-                mPart = p;
-                mPart.diskSeq = seq;
-                return OK;
-            }
-        }
+    // In the drive's VM, as everything else that touches the volume's filesystem: no mkfs runs on Android. The new
+    // filesystem has a new serial, so the UUID changes: the VM reads it, as blkid did at mount.
+    fsvm::Part formatted;
+    bool recheck = false;
+    status_t res = mDrive->format(mPart, pick, &formatted, &recheck);
+    if (recheck) {
+        // Formatted without a read back, or perhaps formatted: a new probe shows what the medium holds now.
+        auto disk = VolumeManager::Instance()->findDisk(getDiskId());
+        if (disk) disk->recheckAfterFormat();
     }
-    LOG(WARNING) << getId() << ": the filesystem VM did not confirm the new " << pick << " filesystem";
+    if (res != OK) {
+        LOG(ERROR) << getId() << " failed to format" << (recheck ? ", perhaps in part: the disk is read again" : "");
+        return -EIO;
+    }
+    mPart = formatted;
     return OK;
 }
 
@@ -510,7 +470,8 @@ void PublicVolume::doPostMount() {
 
 void PublicVolume::prepareStop() {
     // The disk goes with all its volumes: each fsvmd starts writing back now, so that they do it at the same time and
-    // each later stop finds its fsvmd done (vold's lock is held for all of them).
+    // each later stop finds its fsvmd done (vold's lock is held for all of them). A drive's partitions are asked
+    // together, by the disk (Disk::prepareStopAll).
     if (getState() == State::kMounted && mFsvmdPid > 0) fsvm::RequestWriteBack(mFsvmdPid);
 }
 

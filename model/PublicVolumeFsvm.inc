@@ -19,11 +19,14 @@
  * inside the class at its end, which it leaves private. Defined in PublicVolumeFsvm.cpp.
  */
   public:
-    /* The fsvmd serving this volume, or -1 (an OBB on the card guards its own steps with it) */
-    pid_t getFsvmdPid() const { return mFsvmdPid; }
-    /* A partition the filesystem VM read from the whole disk `diskDevice` (phase 2) */
+    /* A guard for steps that go through this volume's FUSE mount within `ms` (fsvm::Guard), or null when the volume
+     * is not served: a volume of its own stops its fsvmd, a drive's partition has its FUSE connection aborted. An OBB
+     * on the card guards its own steps with it. */
+    std::unique_ptr<fsvm::Guard> guardInVm(int ms) const;
+    /* A partition the filesystem VM read from the whole disk `diskDevice` (phase 2), served by its drive's VM
+     * `drive` (null for a placeholder, which is never served) */
     PublicVolume(dev_t diskDevice, const std::string& diskDevPath, const std::string& diskSysPath,
-                 uint64_t diskBytes, const fsvm::Part& part);
+                 uint64_t diskBytes, const fsvm::Part& part, std::shared_ptr<fsvm::Drive> drive);
     void prepareStop() override;
     bool waitingForPlace() const override { return mWaitingForPlace; }
     /* What the filesystem VM read of the volume's partition (Disk::remakeWaitingVolumes) */
@@ -48,15 +51,13 @@
     status_t serveInVm(gid_t gid, bool* servedReadOnly);
     int guardMs() const;
     status_t formatInVm(const std::string& fsType);
-    /* A device-mapper range of exactly this partition (fs/Fsvm.h CreateRange), or the disk for index 0 */
-    status_t createRange(bool readOnly, std::string* path);
-    void removeRange();
     /*
      * The repair of errors the check after the mount found, when it would take longer than apps may wait: the volume
      * is unmounted and shows as checking (as stock's check before the mount), the VM repairs it with no time limit
-     * (fsvm::StartRepair) while vold waits without its lock, then it is mounted again. An eject or removal meanwhile
-     * stops the repair (the volume keeps its dirty mark). A repair that failed (a check that failed, too little memory
-     * for the card's table) leaves the volume read-only, with its notice, from the next check on.
+     * (its drive's VM, fsvm::Drive::startRepair, or a VM of its own, fsvm::StartRepair) while vold waits without its
+     * lock, then it is mounted again. An eject or removal meanwhile stops the repair (the volume keeps its dirty
+     * mark). A repair that failed (a check that failed, too little memory for the card's table) leaves the volume
+     * read-only, with its notice, from the next check on.
      */
     pid_t startRepairInVm(pid_t servingPid);
     void endRepairInVm(pid_t repairPid, int rc);
@@ -79,13 +80,22 @@
     };
 
   private:
-    /* fsvmd serving this volume from a protected VM, or -1 */
+    /* fsvmd serving this volume from a protected VM of its own (a virtual disk's), or -1 */
     pid_t mFsvmdPid = -1;
+    /* The drive's VM that serves this partition, with the drive's other partitions (fs/FsvmDrive.h) */
+    std::shared_ptr<fsvm::Drive> mDrive;
+    /* Served by the drive's VM now */
+    bool mAttached = false;
+    /* What fsvmd's Watch callbacks name while the volume is served (fsvmd's pid, or the drive's ID for it), or 0 */
+    pid_t mServing = 0;
+    /* Serves the partition from its drive's VM */
+    status_t serveOnDrive(gid_t gid, bool* servedReadOnly);
     /* The last stop of fsvmd could not write the volume back (state kNotWrittenBack) */
     bool mWriteBackFailed = false;
     /* When the current mount began (fsvm, NowMs), for the deadline of the steps after the VM served it */
     int64_t mMountStartMs = 0;
-    /* Stops fsvmd, frees its serving slot and removes the partition's range, on every way out of an unmount */
+    /* Stops fsvmd and frees its serving slot, or detaches the partition from its drive's VM, on every way out of an
+     * unmount */
     void stopInVm();
 
     /* Phase 2: the partition the VM read, on the whole disk at mDiskDevPath */
@@ -98,9 +108,6 @@
     bool mVmFailed = false;
     /* The last mount found no protected VM place free (fsvm::Spawn): mounted again when one is free */
     bool mWaitingForPlace = false;
-    /* The partition's device-mapper range while its VM or a format uses it (dm name and vold's node) */
-    std::string mRangeName;
-    std::string mRangeNode;
-    /* The fsvmd repairing the volume, or -1, and whether a repair failed for it */
+    /* The repair running for the volume (an fsvmd's pid, or a drive's token), or -1, and whether a repair failed */
     pid_t mRepairPid = -1;
     bool mRepairFailed = false;

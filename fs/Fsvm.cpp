@@ -15,6 +15,7 @@
  */
 
 #include "Fsvm.h"
+#include "FsvmChild.h"
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -71,7 +72,8 @@ namespace fsvm {
 
 /*
  * One fsvmd service per slot, each with a user of its own (vendor/diamaneos fsvm/fsvmd.rc and config.fs): one probe,
- * kMaxServing served volumes and four OBB images (ObbVolumeFsvm.cpp kMaxObbVms) at a time. No service runs from boot:
+ * kMaxServing drives (one VM for all public partitions of a card or USB drive) or volumes of their own, and four OBB
+ * images (ObbVolumeFsvm.cpp kMaxObbVms) at a time. No service runs from boot:
  * vold starts a slot it does not use now for each fsvmd (StartOn), and the service ends with that fsvmd.
  * scripts/p3-slots-check.py checks that these lists, fsvmd.rc and config.fs agree.
  */
@@ -85,7 +87,8 @@ static const char* const kObbSlots[] = {"obb_0", "obb_1", "obb_2", "obb_3"};
  * - probe: fsvmd keeps to 20 s (PROBE_BUDGET), vold reads for at most 23 s, then Reap takes at most 4 s in all.
  *   At most 27 s. Probes of all disks share a limit (TakeProbe), so a device that comes and goes in a loop cannot
  *   keep vold starting VMs.
- * - format: the wipe and the format tool, then one probe of at most 10 s (plus 1 s for the kill), never the 27 s.
+ * - format: in the drive's VM (FsvmDrive.cpp), the wipe, the VM's start when none runs, the format tool and the read
+ *   of the new filesystem: 45 s (kFormatTimeoutMs), plus the VM's end of 10 s when nothing else of the drive is served.
  * - OBB on a card: the open and its attributes go through the card's fsvmd, guarded for 8 s.
  * - mount: fsvmd keeps to 34 s (SERVE_BUDGET: VM starts, the mount, the first free-space count), vold waits 37 s.
  *   A volume marked dirty is mounted read-only and checked in the VM afterwards, outside the lock (fsvmd fs.rs
@@ -94,29 +97,25 @@ static const char* const kObbSlots[] = {"obb_0", "obb_1", "obb_2", "obb_3"};
  *   of at most 3 s (55 s). A failure after it runs doUnmount, whose steps fail at once on the ended FUSE connection and whose stop
  *   finds fsvmd ended: a few seconds more.
  * - unmount: OBB images served from the card are stopped together first (3 s), the steps before the stop get 15 s
- *   (a Guard ends fsvmd when FUSE requests hang), the orderly stop at most kSyncMs plus 3 s. At most 47 s. When a
+ *   (a Guard ends fsvmd, or aborts a drive partition's FUSE connection, when FUSE requests hang), the orderly stop at
+ *   most kSyncMs plus 3 s. At most 47 s. When a
  *   disk goes with several volumes, all of them are asked to write back first (RequestWriteBack) and do so at the
  *   same time, so each later stop finds its fsvmd done.
  * - ranges: a removal is one try, never a wait (a range still held goes when it is closed, DeleteRange).
  */
 static constexpr int kProbeTimeoutMs = 23000;
-static constexpr int kReadyTimeoutMs = 37000;
 /*
- * After vold unmounted FUSE, fsvmd writes back and unmounts in the VM: 2 s for a call in progress, then as long as the
- * VM's dirty data keeps going down, at most 22 s in all (fsvmd CLOSE_LOCK_WAIT and CLOSE_MAX).
+ * FsvmChild.h: kReadyTimeoutMs 37 s for a mount. kSyncMs 26 s: after vold unmounted FUSE, fsvmd writes back and
+ * unmounts in the VM, 2 s for a call in progress, then as long as the VM's dirty data keeps going down, at most 22 s in
+ * all (fsvmd CLOSE_LOCK_WAIT and CLOSE_MAX). kTermMs and kKillMs after a stop request, then after a kill. kVmEndMs 10
+ * s: after a probe's or a format's answer fsvmd still ends its VM, and the hypervisor gives the VM's memory back first,
+ * which took more than 3 s after a format, and an answer that came whole counts however fsvmd ends. kStartMs 3 s: init
+ * starts the service, which then answers a request at once (it only forks).
+ *
+ * A drive's VM (FsvmDrive.cpp) serves all public partitions of one SD card or USB drive, with one fsvmd and one slot:
+ * its mount and unmount steps keep to the same bounds, through requests on the drive's socket.
  */
-static constexpr int kSyncMs = 26000;
-/* After a stop request, then after a kill. */
-static constexpr int kTermMs = 2000;
-static constexpr int kKillMs = 1000;
-/*
- * After a probe's or a format's answer fsvmd still ends its VM, and the hypervisor gives the VM's memory back first,
- * which took more than 3 s after a format. An answer that came whole counts however fsvmd ends.
- */
-static constexpr int kVmEndMs = 10000;
-/* init starts the service, which then answers a request at once: it only forks. */
-static constexpr int kStartMs = 3000;
-/* Serving VMs at a time, OBB images excluded (ObbVolume has its own caps). */
+/* Serving fsvmd processes of a volume of their own at a time, OBB images and drives excluded. */
 static constexpr int kMaxServing = 6;
 static_assert(std::size(kVolumeSlots) == kMaxServing, "one fsvmd slot per served volume");
 static std::atomic<int> sServing{0};
@@ -125,7 +124,7 @@ static constexpr size_t kMaxParts = 16;
 static constexpr uint32_t kMaxIndex = 128;
 static constexpr size_t kMaxLabelBytes = 47;
 
-static int64_t NowMs() {
+int64_t NowMs() {
     struct timespec ts;
     clock_gettime(CLOCK_BOOTTIME, &ts);
     return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
@@ -157,10 +156,23 @@ static std::map<pid_t, unique_fd> sRepairPipes;
 static constexpr const char* kPoolDir = "/sys/class/misc/gunyah_vm_pool/";
 /* What a VM of vold's takes from the pool besides its RAM: the firmware region and its bounce buffers. */
 static constexpr uint64_t kVmExtraMiB = 4 + 6;
-/* fsvmd's VM sizes (fsvm proto layout.rs PROBE_MIB and MIN_SERVE_MIB): a probe or an OBB image, and a volume. A
- * volume's VM may be larger, and falls back to the smallest serving VM when that does not start. */
-static constexpr uint64_t kSmallVmMiB = 64;
-static constexpr uint64_t kVolumeVmMiB = 96;
+/* fsvmd's largest VM (fsvm proto layout.rs MAX_SERVE_MIB). Its smallest are kProbeVmMib and kServeVmMib (PROBE_MIB
+ * and MIN_SERVE_MIB): a volume's VM may be larger, and falls back to the smallest serving VM when that does not
+ * start. */
+static constexpr uint64_t kMaxVmMiB = 256;
+
+uint64_t ObbVmMib(uint64_t diskBytes) {
+    // fsvmd main.rs obb_memory_mib: the probe VM's size up to 2 GiB, a serving VM's least above.
+    return diskBytes <= (2ULL << 30) ? kProbeVmMib : kServeVmMib;
+}
+
+uint64_t RepairVmMib(const std::string& fsType, uint64_t metaBytes) {
+    // fsvmd main.rs repair_memory_mib: the volume's serving VM, or the largest one without its metadata size.
+    if (metaBytes == 0) return kMaxVmMiB;
+    const uint64_t meta = std::min<uint64_t>((metaBytes >> 20) + ((metaBytes & ((1 << 20) - 1)) != 0), 1 << 20);
+    const uint64_t want = fsType == "exfat" ? 80 + meta : 64 + std::min<uint64_t>(meta * 5 / 4, 160);
+    return std::clamp(want, kServeVmMib, kMaxVmMiB);
+}
 
 static bool ReadPoolValue(const char* name, uint64_t* value) {
     std::string text;
@@ -204,6 +216,10 @@ static bool RefusedForRoom(int rc, bool drive) {
     if (rc != kExitNoRoom) return false;
     if (drive && sStopObbForDrive) sStopObbForDrive();
     return true;
+}
+
+void NoRoomForDrive() {
+    if (sStopObbForDrive) sStopObbForDrive();
 }
 
 /* Drops fsvmd `pid` from the tables after its end was read elsewhere (WaitRepair): its connection, and its slot. */
@@ -335,17 +351,17 @@ static pid_t StartOn(const char* slot, const std::vector<std::string>& args, int
     }
 }
 
-/* The first slot of the request's kind (a probe, an OBB image or a volume) vold does not use now runs fsvmd. */
-static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5) {
-    // A format runs where probes run (the probe slot), one at a time under vold's lock.
-    const bool probe = !args.empty() && (args[0] == "--probe" || args[0] == "--format");
+/* The first slot of the request's kind (a probe, an OBB image, or a drive or a volume) vold does not use now runs
+   fsvmd. */
+pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int fd5, uint64_t vmMib) {
+    const bool probe = !args.empty() && args[0] == "--probe";
     const bool obb = !args.empty() && args[0] == "--obb";
     const char* const* slots = probe ? kProbeSlots : obb ? kObbSlots : kVolumeSlots;
     size_t n = probe ? std::size(kProbeSlots) : obb ? std::size(kObbSlots) : std::size(kVolumeSlots);
-    // Room first. An OBB image is the lowest priority: it never stops anything. A drive's VM (probe, format, volume,
+    // Room first. An OBB image is the lowest priority: it never stops anything. A drive's VM (probe, drive, volume,
     // repair) stops one OBB image's VM when the room it needs is missing, never the decode service's or another
     // drive's.
-    const uint64_t mib = probe || obb ? kSmallVmMiB : kVolumeVmMiB;
+    const uint64_t mib = vmMib ? vmMib : probe || obb ? kProbeVmMib : kServeVmMib;
     if (obb && sDrivesWait) {
         LOG(WARNING) << "fsvm: no protected VM place for an OBB image: a drive waits for room, and OBB images come last";
         errno = EAGAIN;
@@ -356,7 +372,7 @@ static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int f
         if (RoomFor(mib, &why)) break;
         if (!obb && tries < 2 && sStopObbForDrive && sStopObbForDrive()) continue;
         LOG(WARNING) << "fsvm: no protected VM place for "
-                     << (probe ? "a probe or format" : obb ? "an OBB image" : "a volume") << ": " << why
+                     << (probe ? "a probe" : obb ? "an OBB image" : "a drive or volume") << ": " << why
                      << (obb ? ", and OBB images come last" : "");
         errno = EAGAIN;
         return -1;
@@ -377,20 +393,20 @@ static pid_t Spawn(const std::vector<std::string>& args, int fd3, int fd4, int f
         errno = e;
         if (errno != EBUSY) return -1;
     }
-    LOG(ERROR) << "fsvm: no free fsvmd slot for " << (probe ? "a probe or format" : obb ? "an OBB image" : "a volume");
+    LOG(ERROR) << "fsvm: no free fsvmd slot for " << (probe ? "a probe" : obb ? "an OBB image" : "a drive or volume");
     errno = EBUSY;
     return -1;
 }
 
 /* A second descriptor of fsvmd `pid`'s connection, for a thread that outlives vold's own (Watch, Guard). */
-static unique_fd Connection(pid_t pid) {
+unique_fd Connection(pid_t pid) {
     std::lock_guard<std::mutex> lock(sChildrenLock);
     auto it = sChildren.find(pid);
     if (it == sChildren.end()) return {};
     return unique_fd(fcntl(it->second.get(), F_DUPFD_CLOEXEC, 0));
 }
 
-static void Tell(int conn, char c) {
+void Tell(int conn, char c) {
     TEMP_FAILURE_RETRY(send(conn, &c, 1, MSG_NOSIGNAL));
 }
 
@@ -399,7 +415,7 @@ static void Tell(int conn, char c) {
  * and last kills it and waits kKillMs. Returns its exit status, or -1 when it had to be killed. At most waitMs plus
  * termMs plus kKillMs in all.
  */
-static int Reap(pid_t pid, int waitMs, int termMs) {
+int Reap(pid_t pid, int waitMs, int termMs) {
     unique_fd conn;
     {
         std::lock_guard<std::mutex> lock(sChildrenLock);
@@ -566,7 +582,7 @@ bool SameLayout(const Layout& a, const Layout& b) {
 }
 
 /* Reads everything fsvmd writes to `fd` until it closes, within `deadline` (NowMs). */
-static status_t ReadAll(int fd, int64_t deadline, size_t max, std::string* out) {
+status_t ReadAll(int fd, int64_t deadline, size_t max, std::string* out) {
     char buf[512];
     for (;;) {
         int64_t left = deadline - NowMs();
@@ -603,8 +619,10 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
                          std::to_string(blockSize)},
                         dev.get(), -1, wr.get());
     if (child < 0) {
+        // EAGAIN: no room for the VM, EBUSY: its slot is taken. Both wait for a place, neither is a failure.
+        const int e = errno;
         LOG(ERROR) << "fsvm: fsvmd did not start for " << diskPath;
-        return errno == EAGAIN ? -EAGAIN : -EIO;
+        return e == EAGAIN || e == EBUSY ? -EAGAIN : -EIO;
     }
     wr.reset();
     dev.reset();
@@ -632,62 +650,15 @@ status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int
     return OK;
 }
 
-/* fsvmd keeps to 40 s for a format (FORMAT_BUDGET), vold reads for 45 s: under vold's lock, as mkfs ran before. */
-static constexpr int kFormatTimeoutMs = 45000;
-
-status_t Format(const std::string& path, const std::string& fsType, dev_t disk, const std::string& seq) {
-    if (fsType != "vfat" && fsType != "exfat") return -EINVAL;
-    unique_fd dev(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDWR | O_CLOEXEC)));
-    if (dev < 0) {
-        PLOG(ERROR) << "fsvm: opening " << path << " to format it";
-        return -errno;
-    }
-    // A format chosen for the medium the probe read, never for one put in since.
-    if (disk && !SameMedium(disk, seq)) {
-        LOG(ERROR) << "fsvm: the medium changed since " << path << " was read, not formatting it";
-        return -ENODEV;
-    }
-    uint64_t bytes = 0;
-    uint32_t blockSize = BlockSize(dev.get());
-    if (GetBlockDevSize(dev.get(), &bytes) != OK || bytes < 512 || !blockSize) return -EINVAL;
-    int p[2];
-    if (pipe2(p, O_CLOEXEC)) return -errno;
-    unique_fd rd(p[0]), wr(p[1]);
-    pid_t child = Spawn({"--format", fsType, "--disk-bytes", std::to_string(bytes & ~511ULL), "--block-size",
-                         std::to_string(blockSize)},
-                        dev.get(), -1, wr.get());
-    if (child < 0) {
-        LOG(ERROR) << "fsvm: fsvmd did not start to format " << path;
-        return errno == EAGAIN ? -EAGAIN : -EIO;
-    }
-    wr.reset();
-    dev.reset();
-    std::string text;
-    status_t res = ReadAll(rd.get(), NowMs() + kFormatTimeoutMs, 16, &text);
-    // The VM answers OK only after the format and a sync of the disk (fsvm_guest.c do_format).
-    const bool done = res == OK && text == "OK\n";
-    int rc = Reap(child, res == OK ? kVmEndMs : 0, 0);
-    if (RefusedForRoom(rc, true)) {
-        LOG(WARNING) << "fsvm: no protected VM place to format " << path << ": its VM was refused at its start";
-        return -EAGAIN;
-    }
-    if (!done || (rc != 0 && rc != -1)) {
-        LOG(ERROR) << "fsvm: the filesystem VM did not format " << path << " (" << res << ", exit " << rc << ")";
-        return -EIO;
-    }
-    if (rc == -1) LOG(WARNING) << "fsvm: fsvmd did not end within " << kVmEndMs << " ms after formatting " << path;
-    LOG(INFO) << "fsvm: " << path << " formatted as " << fsType << " in the filesystem VM";
-    return OK;
-}
-
 /*
  * Waits for fsvmd to end and, when it ended on its own while its volume is still mounted (its VM broke and no new
  * one came up), has the volume unmounted and reported as not opened. Meanwhile passes on what fsvmd says of the VM's
  * check after the mount, from its pipe: W (writable now), F (it stays read-only), c (a new VM checks it again,
- * read-only meanwhile), E (the errors need a repair longer than apps may wait, PublicVolume::startRepairInVm).
+ * read-only meanwhile), E (the errors need a repair longer than apps may wait, PublicVolume::startRepairInVm). A
+ * drive's partition (`pipeEnds`) ends when its pipe closes too: the drive's fsvmd serves its other partitions on.
  */
-static void Watch(unique_fd conn, unique_fd ready, std::string volumeId, pid_t pid) {
-    std::thread([conn = std::move(conn), ready = std::move(ready), volumeId, pid]() {
+void Watch(unique_fd conn, unique_fd ready, std::string volumeId, pid_t serving, bool pipeEnds) {
+    std::thread([conn = std::move(conn), ready = std::move(ready), volumeId, serving, pipeEnds]() {
         // The service closes the connection once fsvmd ended. Answers are left for Reap to read.
         struct pollfd pfd[2] = {{conn.get(), 0, 0}, {ready.get(), POLLIN, 0}};
         for (;;) {
@@ -699,38 +670,48 @@ static void Watch(unique_fd conn, unique_fd ready, std::string volumeId, pid_t p
                 if (TEMP_FAILURE_RETRY(read(ready.get(), &c, 1)) == 1 && (c == 'W' || c == 'F' || c == 'c' || c == 'E')) {
                     std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
                     auto vol = VolumeManager::Instance()->findVolume(volumeId);
-                    if (vol) vol->onCheckDone(pid, c);
+                    if (vol) vol->onCheckDone(serving, c);
                     continue;
                 }
             }
+            if (pfd[1].revents && pipeEnds) break;  // the partition ended (its pipe closed), or wrote something else
             if (pfd[1].revents) pfd[1].fd = -1;  // fsvmd closed it or wrote something else: only the end counts
         }
         std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getLock());
         auto vol = VolumeManager::Instance()->findVolume(volumeId);
-        if (vol) vol->onFsvmdExit(pid);
+        if (vol) vol->onFsvmdExit(serving);
     }).detach();
+}
+
+status_t MountFuse(const std::string& target, gid_t gid, bool readOnly, unique_fd* fuse) {
+    fuse->reset(TEMP_FAILURE_RETRY(open("/dev/fuse", O_RDWR | O_CLOEXEC)));
+    if (*fuse < 0) {
+        PLOG(ERROR) << "fsvm: opening /dev/fuse";
+        return -errno;
+    }
+    std::string opts = StringPrintf(
+            "fd=%d,rootmode=40000,default_permissions,allow_other,user_id=0,group_id=%d,max_read=131072",
+            fuse->get(), gid);
+    unsigned long flags = MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | (readOnly ? MS_RDONLY : 0);
+    if (mount("/dev/fuse", target.c_str(), "fuse", flags, opts.c_str())) {
+        int e = errno;
+        PLOG(ERROR) << "fsvm: mounting FUSE on " << target;
+        fuse->reset();
+        return -e;
+    }
+    return OK;
 }
 
 status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
     if (servedReadOnly) *servedReadOnly = false;
     *pid = -1;
     if (!v.obb && sServing >= kMaxServing) {
-        LOG(ERROR) << "fsvm: " << kMaxServing << " volumes are served already, not " << v.volumeId;
-        return -EBUSY;
+        // Every slot serves a volume: the volume waits for one (a place), it did not fail.
+        LOG(WARNING) << "fsvm: " << kMaxServing << " volumes are served already, " << v.volumeId << " waits";
+        return -EAGAIN;
     }
-    unique_fd fuse(TEMP_FAILURE_RETRY(open("/dev/fuse", O_RDWR | O_CLOEXEC)));
-    if (fuse < 0) {
-        PLOG(ERROR) << "fsvm: opening /dev/fuse";
-        return -errno;
-    }
-    std::string opts = StringPrintf(
-            "fd=%d,rootmode=40000,default_permissions,allow_other,user_id=0,group_id=%d,max_read=131072",
-            fuse.get(), v.gid);
-    unsigned long flags = MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | (v.obb ? MS_RDONLY : 0);
-    if (mount("/dev/fuse", v.target.c_str(), "fuse", flags, opts.c_str())) {
-        PLOG(ERROR) << "fsvm: mounting FUSE on " << v.target;
-        return -errno;
-    }
+    unique_fd fuse;
+    if (status_t res = MountFuse(v.target, v.gid, v.obb, &fuse); res != OK) return res;
     int p[2];
     if (pipe2(p, O_CLOEXEC)) {
         int e = errno;
@@ -750,12 +731,14 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
                 "--meta-bytes", std::to_string(v.part.metaBytes), "--owner-uid", std::to_string(v.ownerUid)};
         if (v.readOnly) args.push_back("--read-only");
     }
-    pid_t child = Spawn(args, v.fd.get(), fuse.get(), readyWrite.get());
+    // Admitted by the size fsvmd gives the VM: an OBB image's from its size, a volume's smallest serving VM.
+    const uint64_t mib = v.obb ? ObbVmMib(v.diskBytes) : kServeVmMib;
+    pid_t child = Spawn(args, v.fd.get(), fuse.get(), readyWrite.get(), mib);
     if (child < 0) {
         int e = errno;
-        LOG(ERROR) << "fsvm: fsvmd did not start for " << v.volumeId;
+        LOG(ERROR) << "fsvm: fsvmd did not start for " << v.volumeId << (e == EBUSY ? ": all its slots are taken" : "");
         umount2(v.target.c_str(), MNT_DETACH);
-        return -e;
+        return !v.obb && e == EBUSY ? -EAGAIN : -e;
     }
     readyWrite.reset();
     v.fd.reset();
@@ -777,7 +760,7 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
         if (conn >= 0) {
             // A card's pipe stays open for the check's end, and for a check a new VM starts after a broken session.
             if (v.obb) readyRead.reset();
-            Watch(std::move(conn), std::move(readyRead), v.volumeId, child);
+            Watch(std::move(conn), std::move(readyRead), v.volumeId, child, false);
         } else {
             PLOG(WARNING) << "fsvm: fsvmd " << child << " is not watched";
         }
@@ -830,7 +813,8 @@ pid_t StartRepair(Volume&& v) {
                                      "--fs", v.part.fsType.empty() ? "-" : v.part.fsType,
                                      // The repair VM is sized like the volume's serving VM.
                                      "--meta-bytes", std::to_string(v.part.metaBytes)};
-    pid_t pid = Spawn(args, v.fd.get(), -1, wr.get());
+    // Admitted by the size fsvmd gives the repair's first VM.
+    pid_t pid = Spawn(args, v.fd.get(), -1, wr.get(), RepairVmMib(v.part.fsType, v.part.metaBytes));
     if (pid <= 0) {
         LOG(ERROR) << "fsvm: no fsvmd for the repair of " << v.volumeId;
         return -1;
@@ -933,9 +917,9 @@ void SetDrivesWaiting(bool waiting) {
     sDrivesWait = waiting;
 }
 
-bool RoomForDrive() {
+bool RoomForVm(uint64_t mib) {
     std::string why;
-    return RoomFor(kVolumeVmMiB, &why);
+    return RoomFor(mib, &why);
 }
 
 size_t PlacesInUse() {
@@ -958,6 +942,16 @@ struct Guard::State {
     bool done = false;
     unique_fd conn;
 };
+
+Guard::Guard(std::function<void()> stuck, int ms) : mState(std::make_shared<State>()) {
+    std::thread([state = mState, stuck = std::move(stuck), ms]() {
+        std::unique_lock<std::mutex> l(state->lock);
+        if (!state->cv.wait_for(l, std::chrono::milliseconds(ms), [&] { return state->done; }) && stuck) {
+            LOG(ERROR) << "fsvm: the steps around a drive's partition took too long, ending its FUSE connection";
+            stuck();
+        }
+    }).detach();
+}
 
 Guard::Guard(pid_t pid, int ms) : mState(std::make_shared<State>()) {
     // Through fsvmd's connection to the service, which signals only its own child, never a reused pid.

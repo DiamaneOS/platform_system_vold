@@ -88,11 +88,6 @@ struct Layout {
  * (the check after a format) ends the probe early. */
 status_t Probe(const std::string& diskPath, uint64_t diskBytes, Layout* out, int timeoutMs = 0);
 
-/* Formats the block device at `path` (a partition's range, or a whole-disk volume) as `fsType` ("vfat" or "exfat")
- * in a filesystem VM, with the pinned tree's newfs_msdos or mkfs.exfat and vold's former arguments. No mkfs runs on
- * Android for a card or USB drive. Refused when `disk` no longer holds the medium `seq` (SameMedium). */
-status_t Format(const std::string& path, const std::string& fsType, dev_t disk = 0, const std::string& seq = "");
-
 /* Whether `disk` still holds the medium whose sequence number (diskseq) a probe saw as `seq`. An empty `seq` (a
  * kernel without diskseq) always matches. */
 bool SameMedium(dev_t disk, const std::string& seq);
@@ -114,6 +109,9 @@ uint32_t BlockSize(int fd);
 bool OffersFormat(const Layout& l);
 /* Whether two probes of a disk gave the same answer, every field of every partition. */
 bool SameLayout(const Layout& a, const Layout& b);
+
+/* One VM for all public partitions of an SD card or USB drive (FsvmDrive.h). */
+class Drive;
 
 struct Volume {
     android::base::unique_fd fd; /* the whole disk, or the OBB file */
@@ -217,8 +215,14 @@ void SetPlaceHooks(std::function<bool()> stopObbForDrive, std::function<void()> 
 size_t PlacesInUse();
 /* Whether a drive waits for room: an OBB image's VM does not start meanwhile. */
 void SetDrivesWaiting(bool waiting);
-/* Whether a drive's VM would find room now, read from the pool and the piece count. */
-bool RoomForDrive();
+/* Whether a VM of `mib` MiB would find room now, read from the pool and the piece count. */
+bool RoomForVm(uint64_t mib);
+/* The VM size vold admits a start by, the same fsvmd gives that VM: a probe's (64 MiB), an OBB image's from its size
+ * (ObbVmMib), a repair's first VM (RepairVmMib), a volume's smallest serving VM (96 MiB), a drive's (DriveVmMib). */
+static constexpr uint64_t kProbeVmMib = 64;
+static constexpr uint64_t kServeVmMib = 96;
+uint64_t ObbVmMib(uint64_t diskBytes);
+uint64_t RepairVmMib(const std::string& fsType, uint64_t metaBytes);
 
 /* Counts a serving fsvmd that ended (Mount counts the ones that start). */
 
@@ -227,11 +231,13 @@ void Served(bool obb, bool starting);
 /*
  * Stops fsvmd `pid` (a stop, then a kill 2 s later) unless it is cancelled within `ms`: the steps of a mount after the
  * VM served the volume, and of an unmount before fsvmd stops, go through fsvmd, and vold holds its lock until they
- * end.
+ * end. A drive's partition is guarded with `stuck` instead (Drive::stuck): its FUSE connection is aborted, which
+ * fails the steps at once and leaves the drive's other partitions served.
  */
 class Guard {
   public:
     Guard(pid_t pid, int ms);
+    Guard(std::function<void()> stuck, int ms);
     ~Guard();
 
   private:

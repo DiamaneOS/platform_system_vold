@@ -14,10 +14,18 @@
  * limitations under the License.
  */
 
+#include <android-base/file.h>
+#include <android-base/unique_fd.h>
 #include <gtest/gtest.h>
+#include <sys/inotify.h>
+#include <sys/socket.h>
 #include <sys/sysmacros.h>
+#include <unistd.h>
+
+#include <thread>
 
 #include "../fs/Fsvm.h"
+#include "../fs/FsvmDrive.h"
 
 // vold's main.cpp defines it, and CreateRange refers to it through CreateDeviceNode. The tests never get that far.
 struct selabel_handle* sehandle;
@@ -232,6 +240,256 @@ TEST(FsvmTest, ProbeMemory) {
     EXPECT_EQ(Next::kRead, m.next("6", kDisk, 4100, false, false, false));
     EXPECT_FALSE(m.took("6", kDisk, 4100));
     EXPECT_EQ(Next::kSkip, m.next("6", kDisk, 4200, false, false, false));
+}
+
+static Part DrivePart(uint32_t index, const char* fs, uint64_t metaBytes) {
+    Part p;
+    p.index = index;
+    p.start = 2048 * index;
+    p.length = 2048;
+    p.fsType = fs;
+    p.metaBytes = metaBytes;
+    return p;
+}
+
+// The same values as fsvm proto layout.rs drive_memory: fsvmd sizes the drive's VM, vold places it by this.
+TEST(FsvmTest, DriveMemoryAsFsvmdSizesIt) {
+    EXPECT_EQ(96u, DriveMemoryMib({DrivePart(1, "vfat", 1 << 20)}));
+    EXPECT_EQ(144u, DriveMemoryMib({DrivePart(1, "vfat", 64 << 20)}));
+    EXPECT_EQ(96u, DriveMemoryMib({}));
+    EXPECT_EQ(113u, DriveMemoryMib({DrivePart(1, "vfat", 1 << 20), DrivePart(2, "vfat", 1 << 20)}));
+    EXPECT_EQ(177u, DriveMemoryMib({DrivePart(1, "exfat", 1 << 20), DrivePart(2, "vfat", 64 << 20)}));
+    EXPECT_EQ(113u, DriveMemoryMib({DrivePart(1, "vfat", 1 << 20), DrivePart(2, "", 0)}));
+    EXPECT_EQ(112u, DriveMemoryMib({DrivePart(1, "", 0), DrivePart(2, "", 0)}));
+    std::vector<Part> large(4, DrivePart(1, "vfat", 256ULL << 20));
+    EXPECT_EQ(256u, DriveMemoryMib(large));
+    std::vector<Part> huge(4, DrivePart(1, "exfat", UINT64_MAX));
+    EXPECT_EQ(256u, DriveMemoryMib(huge));
+}
+
+// The drive's VM gets the public partitions Disk makes volumes of, never a damaged one, never more than its cap.
+TEST(FsvmTest, DriveParts) {
+    Layout l;
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 mbr 6\n"
+                              "PART 1 public 2048 2048 vfat 1111-1111 - 0 -\n"
+                              "PART 2 public 4096 2048 bad - - 0 -\n"
+                              "PART 3 public 6144 2048 - - - 0 -\n"
+                              "PART 5 public 8192 2048 exfat 2222-2222 - 0 -\n"
+                              "PART 6 public 10240 2048 vfat 3333-3333 - 0 -\n"
+                              "PART 7 public 12288 2048 vfat 4444-4444 - 0 -\n"
+                              "END\n",
+                              kDisk, &l));
+    std::vector<Part> d = DriveParts(l, 64, 4);
+    ASSERT_EQ(3u, d.size());
+    EXPECT_EQ(1u, d[0].index);
+    EXPECT_EQ(3u, d[1].index);
+    EXPECT_EQ(5u, d[2].index);
+    d = DriveParts(l, 3, 4);
+    ASSERT_EQ(2u, d.size());
+    EXPECT_EQ(3u, d[1].index);
+    ASSERT_EQ(OK, ParseLayout("LAYOUT 1 none 1\nPART 0 public 0 2048 vfat 1111-1111 - 0 -\nEND\n", kDisk, &l));
+    d = DriveParts(l, 64, 4);
+    ASSERT_EQ(1u, d.size());
+    EXPECT_EQ(0u, d[0].index);
+}
+
+TEST(FsvmTest, DriveAnswers) {
+    uint32_t id = 0;
+    char k = 0;
+    int disk = -1, value = -1;
+    std::string rest;
+    EXPECT_TRUE(ParseDriveAnswer("1 K 0", &id, &k, &disk, &value, &rest));
+    EXPECT_EQ(1u, id);
+    EXPECT_EQ('K', k);
+    EXPECT_EQ(0, value);
+    EXPECT_TRUE(ParseDriveAnswer("4294967295 A 1 11", &id, &k, &disk, &value, &rest));
+    EXPECT_EQ(UINT32_MAX, id);
+    EXPECT_EQ('A', k);
+    EXPECT_EQ(1, disk);
+    EXPECT_EQ(11, value);
+    EXPECT_TRUE(ParseDriveAnswer("7 D 0 3", &id, &k, &disk, &value, &rest));
+    EXPECT_EQ(3, value);
+    EXPECT_TRUE(ParseDriveAnswer("8 F 2 0\nLAYOUT 1 none 1\nEND\n", &id, &k, &disk, &value, &rest));
+    EXPECT_EQ("LAYOUT 1 none 1\nEND\n", rest);
+    EXPECT_TRUE(ParseDriveAnswer("9 F 2 4002", &id, &k, &disk, &value, &rest));
+    EXPECT_EQ(kFormatUncertain, value);
+    EXPECT_FALSE(ParseDriveAnswer("7 D 0 3\nmore", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("7 X 0 0", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("7 A 8 0", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("7 A -1 0", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("7 A 0", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("7 A 0 0 0", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("7 K 0 0", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("7 AA 0 0", &id, &k, &disk, &value, &rest));
+    // Every answer names its request.
+    EXPECT_FALSE(ParseDriveAnswer("A 1 11", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("0 A 1 11", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("01 A 1 11", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("4294967296 A 1 11", &id, &k, &disk, &value, &rest));
+    EXPECT_FALSE(ParseDriveAnswer("+1 A 1 11", &id, &k, &disk, &value, &rest));
+}
+
+// M9: an answer that comes after vold stopped waiting for it never passes for the answer to a later request, and the
+// partition the late request changes takes no new change until that answer came.
+TEST(FsvmTest, LateDriveAnswersAreDropped) {
+    int sv[2];
+    ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv));
+    android::base::unique_fd peer(sv[1]);
+    DriveControl c;
+    c.reset(android::base::unique_fd(sv[0]));
+    // A fake drive fsvmd: the first FORMAT is answered only when the second one comes, before the second's answer.
+    std::thread fsvmd([&peer] {
+        char buf[256];
+        std::string first;
+        for (;;) {
+            ssize_t n = recv(peer.get(), buf, sizeof(buf), 0);
+            if (n <= 0) return;
+            std::string req(buf, n);
+            std::string id = req.substr(0, req.find(' '));
+            if (first.empty()) {
+                first = id;
+                continue;
+            }
+            std::string late = first + " F 0 0\nLAYOUT 1 none 1\nPART 0 public 0 2048 vfat 1111-1111 - 0 -\nEND\n";
+            std::string now = id + " F 0 " + std::to_string(kFormatUncertain);
+            send(peer.get(), late.data(), late.size(), 0);
+            send(peer.get(), now.data(), now.size(), 0);
+        }
+    });
+    int value = -1;
+    std::string text;
+    EXPECT_EQ(-ETIMEDOUT, c.call("FORMAT 0 vfat", {}, 'F', 0, true, 200, &value, &text));
+    EXPECT_TRUE(c.pending(0));
+    EXPECT_FALSE(c.pending(1));
+    EXPECT_EQ(OK, c.call("FORMAT 0 vfat", {}, 'F', 0, true, 5000, &value, &text));
+    // The second request's own answer, not the first one's late "formatted".
+    EXPECT_EQ(kFormatUncertain, value);
+    EXPECT_TRUE(text.empty());
+    // The late answer settled the first request.
+    EXPECT_FALSE(c.pending(0));
+    c.reset();
+    shutdown(peer.get(), SHUT_RDWR);
+    fsvmd.join();
+}
+
+// A format's answer reads as the partition it formatted, which keeps its place and its medium.
+TEST(FsvmTest, FormattedPart) {
+    Part p = DrivePart(2, "", 0);
+    p.diskSeq = "17";
+    p.noFsConfirmed = true;
+    Part out;
+    ASSERT_EQ(OK, FormattedPart("LAYOUT 1 none 1\nPART 0 public 0 2048 vfat 6FFF-FAB8 - 4096 4b61727465\nEND\n", p,
+                                &out));
+    EXPECT_EQ(2u, out.index);
+    EXPECT_EQ(4096u, out.start);
+    EXPECT_EQ(2048u, out.length);
+    EXPECT_EQ("vfat", out.fsType);
+    EXPECT_EQ("6FFF-FAB8", out.fsUuid);
+    EXPECT_EQ("Karte", out.label);
+    EXPECT_EQ(4096u, out.metaBytes);
+    EXPECT_EQ("17", out.diskSeq);
+    EXPECT_FALSE(out.noFsConfirmed);
+    // Another size, a table, nothing found, or a damaged filesystem: not the format's answer.
+    EXPECT_NE(OK, FormattedPart("LAYOUT 1 none 1\nPART 0 public 0 1024 vfat 6FFF-FAB8 - 0 -\nEND\n", p, &out));
+    EXPECT_NE(OK, FormattedPart("LAYOUT 1 mbr 1\nPART 1 public 0 2048 vfat 6FFF-FAB8 - 0 -\nEND\n", p, &out));
+    EXPECT_NE(OK, FormattedPart("LAYOUT 1 none 0\nEND\n", p, &out));
+    EXPECT_NE(OK, FormattedPart("LAYOUT 1 none 1\nPART 0 public 0 2048 bad - - 0 -\nEND\n", p, &out));
+}
+
+// A drive refuses what it does not serve, before any VM.
+TEST(FsvmTest, DriveServesOnlyItsParts) {
+    Drive d(makedev(4095, 1048575), "/dev/block/vold/fsvm-test-none", "disk:4095,1048575");
+    d.setParts({DrivePart(1, "vfat", 0), DrivePart(2, "exfat", 0)});
+    EXPECT_TRUE(d.serves(DrivePart(1, "vfat", 0)));
+    EXPECT_TRUE(d.serves(DrivePart(2, "", 0)));
+    EXPECT_FALSE(d.serves(DrivePart(3, "vfat", 0)));
+    Part moved = DrivePart(1, "vfat", 0);
+    moved.length++;
+    EXPECT_FALSE(d.serves(moved));
+    pid_t serving = 0;
+    EXPECT_EQ(-EIO, d.attach(DrivePart(3, "vfat", 0), 1023, 0, "public:4095,3", "/nonexistent", &serving, nullptr));
+    EXPECT_EQ(0, serving);
+    EXPECT_EQ(0, d.detach(DrivePart(1, "vfat", 0), true));
+    EXPECT_EQ(-1, d.startRepair(DrivePart(1, "vfat", 0)));
+    EXPECT_FALSE(static_cast<bool>(d.stuck(DrivePart(1, "vfat", 0))));
+}
+
+// L3: a format whose outcome is not known for sure has the disk read again, and only a definite answer counts.
+TEST(FsvmTest, FormatOutcomes) {
+    Part p = DrivePart(1, "", 0);
+    p.diskSeq = "5";
+    p.noFsConfirmed = true;
+    Part out;
+    bool recheck = true;
+    const std::string read = "LAYOUT 1 none 1\nPART 0 public 0 2048 vfat 6FFF-FAB8 - 4096 -\nEND\n";
+    EXPECT_EQ(OK, FormatOutcome(OK, 0, read, p, "vfat", &out, &recheck));
+    EXPECT_FALSE(recheck);
+    EXPECT_EQ("6FFF-FAB8", out.fsUuid);
+    // Formatted, not read back: done, with the type asked for and no UUID, and read again.
+    EXPECT_EQ(OK, FormatOutcome(OK, kFormatUnverified, "", p, "exfat", &out, &recheck));
+    EXPECT_TRUE(recheck);
+    EXPECT_EQ("exfat", out.fsType);
+    EXPECT_TRUE(out.fsUuid.empty());
+    EXPECT_FALSE(out.noFsConfirmed);
+    // Perhaps formatted: a failure, and read again.
+    EXPECT_EQ(-EIO, FormatOutcome(OK, kFormatUncertain, "", p, "vfat", &out, &recheck));
+    EXPECT_TRUE(recheck);
+    EXPECT_EQ(-EIO, FormatOutcome(-ETIMEDOUT, -1, "", p, "vfat", &out, &recheck));
+    EXPECT_TRUE(recheck);
+    EXPECT_EQ(-EIO, FormatOutcome(-EPIPE, -1, "", p, "vfat", &out, &recheck));
+    EXPECT_TRUE(recheck);
+    // An answer that contradicts the request (another filesystem) is not a format that worked.
+    EXPECT_EQ(-EIO, FormatOutcome(OK, 0, read, p, "exfat", &out, &recheck));
+    EXPECT_TRUE(recheck);
+    // Not formatted: no room, or the format tool failed.
+    EXPECT_EQ(-EAGAIN, FormatOutcome(OK, EAGAIN, "", p, "vfat", &out, &recheck));
+    EXPECT_FALSE(recheck);
+    EXPECT_EQ(-EIO, FormatOutcome(OK, EIO, "", p, "vfat", &out, &recheck));
+    EXPECT_FALSE(recheck);
+}
+
+// B2: a format refuses a medium it cannot name as the one it read, before anything opens the disk (no discard, no VM
+// start), also with no sequence known.
+TEST(FsvmTest, FormatTouchesNothingOnAnUnknownMedium) {
+    EXPECT_FALSE(IsMedium(makedev(179, 0), ""));
+    EXPECT_FALSE(IsMedium(makedev(4095, 1048575), "7"));
+    TemporaryDir dir;
+    const std::string disk = std::string(dir.path) + "/disk";
+    ASSERT_TRUE(android::base::WriteStringToFile("x", disk));
+    android::base::unique_fd watch(inotify_init1(IN_NONBLOCK | IN_CLOEXEC));
+    ASSERT_GE(watch.get(), 0);
+    ASSERT_GE(inotify_add_watch(watch.get(), disk.c_str(), IN_OPEN | IN_MODIFY), 0);
+    for (const char* seq : {"", "7"}) {
+        Drive d(makedev(4095, 1048575), disk, "disk:4095,1048575", 64ULL << 30);
+        Part p = DrivePart(0, "vfat", 0);
+        p.start = 0;
+        p.diskSeq = seq;
+        d.setParts({p});
+        Part out;
+        bool recheck = true;
+        EXPECT_EQ(-ENODEV, d.format(p, "vfat", &out, &recheck)) << "sequence '" << seq << "'";
+        EXPECT_FALSE(recheck);
+    }
+    char buf[4096];
+    EXPECT_LE(read(watch.get(), buf, sizeof(buf)), 0) << "the disk was opened";
+}
+
+// M8: vold admits each VM by the size fsvmd gives it (fsvm proto layout.rs, fsvmd main.rs): a drive by the smallest
+// serving VM fsvmd falls back to, an OBB image by its size, a repair by its first VM.
+TEST(FsvmTest, AdmissionSizesAsFsvmd) {
+    EXPECT_EQ(std::vector<uint64_t>({96}), DriveVmMib({DrivePart(1, "vfat", 1 << 20)}));
+    EXPECT_EQ(std::vector<uint64_t>({144, 96}), DriveVmMib({DrivePart(1, "vfat", 64 << 20)}));
+    std::vector<Part> large(4, DrivePart(1, "vfat", 256ULL << 20));
+    EXPECT_EQ(std::vector<uint64_t>({256, 96}), DriveVmMib(large));
+    EXPECT_EQ(64u, ObbVmMib(2ULL << 30));
+    EXPECT_EQ(96u, ObbVmMib((2ULL << 30) + 512));
+    EXPECT_EQ(256u, RepairVmMib("vfat", 0));
+    EXPECT_EQ(144u, RepairVmMib("vfat", 64 << 20));
+    EXPECT_EQ(96u, RepairVmMib("vfat", 1 << 20));
+    EXPECT_EQ(145u, RepairVmMib("exfat", 65 << 20));
+    EXPECT_EQ(256u, RepairVmMib("exfat", UINT64_MAX));
+    EXPECT_EQ(224u, RepairVmMib("vfat", UINT64_MAX));
 }
 
 }  // namespace fsvm

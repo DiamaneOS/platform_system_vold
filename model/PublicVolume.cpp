@@ -156,7 +156,7 @@ status_t PublicVolume::doMount() {
 
 #ifdef VOLD_PUBLIC_FS_IN_VM  // DiamaneOS: fsvmd serves it from a protected VM, no fallback (PublicVolumeFsvm.cpp)
     if (status_t res = mountInVm(isVisible ? AID_MEDIA_RW : AID_EXTERNAL_STORAGE); res != OK) return res;
-    fsvm::Guard guard(mFsvmdPid, guardMs());
+    auto guard = guardInVm(guardMs());
 #else
     if (mFsType == "vfat") {
         if (vfat::Mount(mDevPath, mRawPath, false, false, false, AID_ROOT,
