@@ -21,10 +21,12 @@
 #include "Utils.h"
 #include "VolumeBase.h"
 #include "fs/Fsvm.h"
+#include "fs/FsvmRangeHolds.h"
 
 #include <utils/Errors.h>
 
 #include <vector>
+#include <map>
 
 namespace android {
 namespace vold {
@@ -80,7 +82,10 @@ class Disk {
     std::vector<std::shared_ptr<VolumeBase>> getVolumes() const;
 
     status_t create();
-    status_t destroy();
+    bool isVmDisk() const;
+    status_t preflightStop(bool* isolated = nullptr);
+    status_t destroy(bool removed = false);
+    bool removalPending() const { return mRemovalPending; }  // DiamaneOS: teardown was refused
 
     status_t readMetadata();
     status_t readPartitions();
@@ -125,7 +130,8 @@ class Disk {
     /* DiamaneOS: the filesystem VM's members (DiskFsvm.cpp), private when it ends */
 #include "model/DiskFsvm.inc"
 
-    void destroyAllVolumes();
+    status_t destroyAllVolumes();
+    bool mRemovalPending = false;  // DiamaneOS: a kernel removal event is awaiting safe teardown
 
     int getMaxMinors();
 

@@ -40,4 +40,7 @@ oneway interface IVoldListener {
     void onDiskFormatOffer(@utf8InCpp String diskId, boolean offer);
     // DiamaneOS: a volume served read-only while its filesystem VM checks it. Writing can come back after the check.
     void onVolumeCheckPending(@utf8InCpp String volId, boolean pending);
+    // DiamaneOS: identity of the probe that supplies this scan, never a fresh identity at erase time.
+    void onDiskMedium(@utf8InCpp String diskId, @utf8InCpp String generation, long sizeBytes);
+
 }

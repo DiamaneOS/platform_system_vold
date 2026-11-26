@@ -12,6 +12,7 @@ cc_test {
     ],
 
     srcs: [
+        "FsvmStorage_test.cpp", // DiamaneOS: confirmation, repair retry and verification
         "Fsvm_test.cpp", // DiamaneOS: the filesystem VM's parser and checks
         "FsvmTable_test.cpp", // DiamaneOS: the partition tables vold writes itself
         "Utils_test.cpp",

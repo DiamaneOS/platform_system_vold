@@ -41,6 +41,8 @@
 #include "VoldUtil.h"
 #include "VolumeManager.h"
 #include "WriteBooster.h"
+#include "fs/Fsvm.h"
+#include "model/PublicVolume.h"
 #include "cryptfs.h"
 #include "incfs.h"
 
@@ -188,6 +190,13 @@ binder::Status VoldNativeService::reset() {
     return translate(VolumeManager::Instance()->reset());
 }
 
+binder::Status VoldNativeService::preflightReset() {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    return translate(VolumeManager::Instance()->reset(true));
+}
+
 binder::Status VoldNativeService::shutdown() {
     ENFORCE_SYSTEM_OR_ROOT;
     ACQUIRE_LOCK;
@@ -251,6 +260,43 @@ binder::Status VoldNativeService::onSecureKeyguardStateChanged(bool isShowing) {
     return translate(VolumeManager::Instance()->onSecureKeyguardStateChanged(isShowing));
 }
 
+binder::Status VoldNativeService::partitionConfirmed(const std::string& diskId, int32_t type, int32_t ratio,
+                                                     const std::string& generation, int64_t sizeBytes) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    CHECK_ARGUMENT_ID(diskId);
+    ACQUIRE_LOCK;
+    auto disk = VolumeManager::Instance()->findDisk(diskId);
+    if (!disk || sizeBytes <= 0) return error("No confirmed medium");
+    return translate(disk->partitionConfirmed(type, ratio, generation, sizeBytes));
+}
+
+binder::Status VoldNativeService::partitionPublicForReset(const std::string& diskId,
+                                                        const std::string& generation,
+                                                        int64_t sizeBytes, int64_t deadlineMillis) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    CHECK_ARGUMENT_ID(diskId);
+    ACQUIRE_LOCK;
+    auto disk = VolumeManager::Instance()->findDisk(diskId);
+    if (!disk || sizeBytes <= 0) return error("No confirmed medium");
+    if (deadlineMillis <= android::vold::fsvm::NowMs()) return translate(-ETIMEDOUT);
+    return translate(disk->partitionConfirmed(PARTITION_TYPE_PUBLIC, -1, generation, sizeBytes,
+                                              deadlineMillis));
+}
+
+binder::Status VoldNativeService::partitionPublicRetryConfirmed(const std::string& diskId,
+                                                                const std::string& generation,
+                                                                int64_t sizeBytes) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    CHECK_ARGUMENT_ID(diskId);
+    // Do not queue a fresh erase behind a conflicting operation and run it afterwards.
+    std::unique_lock<std::mutex> lock(VolumeManager::Instance()->getLock(), std::try_to_lock);
+    if (!lock.owns_lock()) return translate(-EBUSY);
+    auto disk = VolumeManager::Instance()->findDisk(diskId);
+    if (!disk || sizeBytes <= 0) return error("No confirmed medium");
+    return translate(disk->partitionConfirmed(PARTITION_TYPE_PUBLIC, -1, generation, sizeBytes,
+                                              0, true));
+}
+
 binder::Status VoldNativeService::partition(const std::string& diskId, int32_t partitionType,
                                             int32_t ratio) {
     ENFORCE_SYSTEM_OR_ROOT;
@@ -311,6 +357,14 @@ binder::Status VoldNativeService::mount(
         return error("Failed to find volume " + volId);
     }
 
+    // DiamaneOS: automatic mounts settle unread state, an explicit retry re-reads the key.
+    const bool rescan = (mountFlags & ::android::os::IVold::MOUNT_FLAG_RESCAN) != 0;
+    mountFlags &= ~::android::os::IVold::MOUNT_FLAG_RESCAN;
+    if (vol->getType() == VolumeBase::Type::kPublic &&
+        fsvm::ReprobeOnMount(static_cast<PublicVolume*>(vol.get())->unreadInVm(), rescan)) {
+        auto disk = VolumeManager::Instance()->findDisk(vol->getDiskId());
+        return disk ? translate(disk->retryPlaceholder(volId)) : error("No disk for placeholder");
+    }
     vol->setMountFlags(mountFlags);
     vol->setMountUserId(mountUserId);
 

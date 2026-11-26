@@ -31,6 +31,13 @@
     virtual bool waitingForPlace() const { return false; }
 
   protected:
+    // Refuse unsupported work before unmount or writeback.
+    virtual status_t prepareFormat() { return OK; }
+    virtual status_t prepareUnmount() { return OK; }
+    // A failed public mount can still hold a raw FUSE attachment.
+    virtual bool hasUnmountWork() const { return false; }
+    virtual State formatOutcomeState() const { return State::kUnmounted; }
+    void showFormatOutcome() { setState(formatOutcomeState()); }
     /* Whether the last failed mount failed in the filesystem VM (state kUnopenable) */
     virtual bool mountFailedInVm() const { return false; }
     /* Whether the last unmount could not write the volume back (state kNotWrittenBack) */

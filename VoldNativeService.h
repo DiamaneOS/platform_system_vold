@@ -35,6 +35,7 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
 
     binder::Status monitor();
     binder::Status reset();
+    binder::Status preflightReset();
     binder::Status shutdown();
     binder::Status abortFuse();
 
@@ -50,6 +51,12 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
 
     binder::Status onSecureKeyguardStateChanged(bool isShowing);
 
+    binder::Status partitionConfirmed(const std::string& diskId, int32_t partitionType, int32_t ratio,
+                                      const std::string& generation, int64_t sizeBytes);
+    binder::Status partitionPublicForReset(const std::string& diskId, const std::string& generation,
+                                          int64_t sizeBytes, int64_t deadlineMillis);
+    binder::Status partitionPublicRetryConfirmed(const std::string& diskId,
+                                                const std::string& generation, int64_t sizeBytes);
     binder::Status partition(const std::string& diskId, int32_t partitionType, int32_t ratio);
     binder::Status forgetPartition(const std::string& partGuid, const std::string& fsUuid);
 

@@ -123,7 +123,7 @@ class VolumeManager {
     /* Aborts all FUSE filesystems, in case the FUSE daemon is no longer up. */
     int abortFuse();
     /* Reset all internal state, typically during framework boot */
-    int reset();
+    int reset(bool preflightOnly = false);
     /* Prepare for device shutdown, safely unmounting all devices */
     int shutdown();
     /* Unmount all volumes, usually for encryption */
@@ -212,6 +212,9 @@ class VolumeManager {
     void destroyEmulatedVolumesForUser(userid_t userId);
 
     void handleDiskAdded(const std::shared_ptr<android::vold::Disk>& disk);
+    int replaceRetainedDisk(dev_t device);   // DiamaneOS: model/DiskFsvm.cpp
+    int destroyShutdownDisks();             // DiamaneOS: model/DiskFsvm.cpp
+    int resetRemovableDisks(bool inVm);    // DiamaneOS: model/DiskFsvm.cpp
     void handleDiskChanged(dev_t device);
     void handleDiskRemoved(dev_t device);
 

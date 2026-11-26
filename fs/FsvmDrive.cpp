@@ -58,7 +58,7 @@ static pid_t sNextRepair = -2;
 
 /* fsvm proto layout.rs: MIN_SERVE_MIB, MAX_SERVE_MIB, DRIVE_PART_MIB and serve_memory_mib. */
 static constexpr uint64_t kMinServeMiB = 96;
-static constexpr uint64_t kMaxServeMiB = 256;
+static constexpr uint64_t kMaxServeMiB = 204;
 static constexpr uint64_t kDrivePartMiB = 16;
 
 static uint64_t MetaMiB(const Part& p) {
@@ -177,6 +177,7 @@ status_t FormatOutcome(status_t call, int value, const std::string& text, const 
             *recheck = true;
             return OK;
         case kFormatUncertain:
+        case kFormatUncertainStopped:
             LOG(ERROR) << "fsvm: the format of partition " << p.index
                        << " broke off in the VM, whether it was formatted is not known: it is read again";
             *recheck = true;
@@ -184,7 +185,9 @@ status_t FormatOutcome(status_t call, int value, const std::string& text, const 
         case EAGAIN:
             return -EAGAIN;
         default:
-            LOG(ERROR) << "fsvm: partition " << p.index << " was not formatted (" << value << ")";
+            // A tool's errno can follow partial writes or a failed post-mkfs flush.
+            *recheck = true;
+            LOG(ERROR) << "fsvm: partition " << p.index << " format was not verified (" << value << ")";
             return -EIO;
     }
 }
@@ -382,45 +385,39 @@ bool Drive::serves(const Part& p) const {
 }
 
 void Drive::removeRanges() {
-    for (const auto& [name, node] : mRanges) DeleteRange(name, node);
+    for (auto& range : mRanges) {
+        range.fd.reset();
+        DeleteRange(range.name, "/dev/block/vold/" + range.name);
+    }
     mRanges.clear();
-    mNodes.clear();
+    mMediumFd.reset();
 }
 
 status_t Drive::start() {
     if (mPid > 0) return OK;
+    if (!mAttached.empty()) return -EBUSY;
     if (mParts.empty()) return -EIO;
+    mMediumFd.reset(TEMP_FAILURE_RETRY(open(mDiskPath.c_str(), O_RDONLY | O_CLOEXEC)));
     // A card with its write-protect switch on, as the kernel mount handled it: every range read-only.
     bool readOnly = false;
     {
         unique_fd probe(TEMP_FAILURE_RETRY(open(mDiskPath.c_str(), O_RDWR | O_CLOEXEC)));
         readOnly = probe < 0 && (errno == EROFS || errno == EACCES);
     }
-    std::vector<unique_fd> fds;
     std::vector<std::string> disks;
     uint32_t blockSize = 0;
     for (const Part& p : mParts) {
-        std::string node = mDiskPath;
-        if (p.index == 0) {
-            // A filesystem on the whole disk: the disk holds nothing else, and its VM gets the disk itself, only while
-            // it holds the medium the probe read (a range checks that as it is set up).
-            if (!SameMedium(mDisk, p.diskSeq)) {
-                LOG(ERROR) << "fsvm: the medium changed since " << mDiskPath << " was read, not serving it";
-                removeRanges();
-                return -ENODEV;
-            }
-        } else {
-            // Exactly this partition's sectors, as a device-mapper range of the disk: the VM's disk for it.
-            std::string name = RangeName(mDisk, p.index);
-            if (status_t res = CreateRange(name, mDisk, p.start, p.length, readOnly, &node, nullptr, p.diskSeq);
-                res != OK) {
-                removeRanges();
-                return res;
-            }
-            mRanges.emplace_back(name, node);
+        // The whole-device slot is also lent through a range, from sector zero to the end.
+        std::string name = RangeName(mDisk, p.index), node;
+        dev_t mapped;
+        if (status_t res = CreateRange(name, mDisk, p.start, p.length, readOnly, &node, &mapped, p.diskSeq);
+            res != OK) {
+            removeRanges();
+            return res;
         }
-        unique_fd fd(TEMP_FAILURE_RETRY(open(node.c_str(), (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC)));
+        auto fd = OpenRange(node, mapped, readOnly);
         uint32_t bs = fd >= 0 ? BlockSize(fd.get()) : 0;
+        mRanges.push_back({name, std::move(fd), p.length, readOnly});
         if (!bs || (blockSize && bs != blockSize)) {
             PLOG(ERROR) << "fsvm: no disk for partition " << p.index << " of " << mDiskPath;
             removeRanges();
@@ -429,8 +426,6 @@ status_t Drive::start() {
         blockSize = bs;
         disks.push_back(StringPrintf("%" PRIu64 ":%s:%" PRIu64, p.length * 512,
                                      p.fsType.empty() ? "-" : p.fsType.c_str(), p.metaBytes));
-        mNodes.push_back(node);
-        fds.push_back(std::move(fd));
     }
     mReadOnly = readOnly;
     std::vector<std::string> args = {"--drive", mDiskId, "--block-size", std::to_string(blockSize)};
@@ -462,9 +457,9 @@ status_t Drive::start() {
     mControl.reset(std::move(mine));
     mPid = pid;
     std::vector<int> raw;
-    for (const auto& fd : fds) raw.push_back(fd.get());
+    for (const auto& range : mRanges) raw.push_back(range.fd.get());
     int value = -1;
-    if (request(StringPrintf("DISKS %zu", fds.size()), raw, 'K', 0, false, kStartMs, &value) != OK || value != 0) {
+    if (request(StringPrintf("DISKS %zu", raw.size()), raw, 'K', 0, false, kStartMs, &value) != OK || value != 0) {
         LOG(ERROR) << "fsvm: the drive's fsvmd refused its disks (" << value << ")";
         kill();
         return -EIO;
@@ -485,7 +480,10 @@ status_t Drive::request(const std::string& msg, const std::vector<int>& fds, cha
 }
 
 bool Drive::mayErase(const Part& p) const {
-    if (!IsMedium(mDisk, p.diskSeq) || !HasSize(mDisk, mDiskBytes)) {
+    const int slot = indexOf(p);
+    if (slot >= 0 && static_cast<size_t>(slot) < mRanges.size() && mRanges[slot].fenceStarted) return false;
+    if (!FencesMedium(mDisk) || !IsMedium(mDisk, p.diskSeq) || !HasSize(mDisk, mDiskBytes) ||
+        (mPid > 0 && !EraseDescriptor(mMediumFd.get(), mDisk, mDiskBytes, p.diskSeq))) {
         LOG(ERROR) << "fsvm: " << mDiskPath << " does not hold the medium it was read from now (or it is not known), "
                    << "not formatting partition " << p.index;
         return false;
@@ -501,13 +499,12 @@ void Drive::gone() {
     }
     mPid = -1;
     mLost.insert(mAttached.begin(), mAttached.end());
-    mAttached.clear();
-    mFuseConn.clear();
-    removeRanges();
+    // A surviving raw FUSE mount still needs the original backing for its teardown decision.
+    endIfIdle();
 }
 
 void Drive::endIfIdle() {
-    if (mPid > 0 && mAttached.empty() && mBusy == 0) end();
+    if (mAttached.empty() && mBusy == 0) end();
 }
 
 void Drive::end() {
@@ -543,6 +540,29 @@ void Drive::requestWriteBack() {
     RequestWriteBack(mPid);
 }
 
+bool Drive::attached(const Part& p) const {
+    return mAttached.count(indexOf(p));
+}
+
+status_t Drive::prepareDetach(const Part& p) {
+    const int slot = indexOf(p);
+    if (slot < 0) return -ENODEV;
+    if (!mAttached.count(slot)) return OK;
+    if (static_cast<size_t>(slot) >= mRanges.size()) return -ENODEV;
+    auto& range = mRanges[slot];
+    if (!range.fenceStarted && IsMedium(mDisk, p.diskSeq) && HasSize(mDisk, mDiskBytes)) return OK;
+    return FenceRange(&range);
+}
+
+status_t Drive::fenceBackings(bool all) {
+    for (auto& range : mRanges) {
+        if (all || range.fenceStarted) {
+            if (auto res = FenceRange(&range); res != OK) return res;
+        }
+    }
+    return OK;
+}
+
 status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::string& volumeId,
                        const std::string& target, bool readOnly, pid_t* serving, bool* servedReadOnly,
                        bool* checking) {
@@ -555,6 +575,7 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
         return -EIO;
     }
     if (status_t res = start(); res != OK) return res == -EAGAIN ? -EAGAIN : -EIO;
+    if (mRanges[k].fenceStarted) return -EIO;
     mControl.settle();
     if (mControl.pending(k)) {
         // An earlier request for the partition got no answer yet (a format or detach still running in the VM).
@@ -570,6 +591,12 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
         return -EIO;
     }
     const unsigned conn = FuseConnection(target);
+    if (!ProtectDriveFuse(conn)) {
+        LOG(ERROR) << "fsvm: could not protect " << volumeId << " from global FUSE abort";
+        umount2(target.c_str(), MNT_DETACH);
+        endIfIdle();
+        return -EIO;
+    }
     int pp[2];
     if (pipe2(pp, O_CLOEXEC)) {
         umount2(target.c_str(), MNT_DETACH);
@@ -577,6 +604,15 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
         return -EIO;
     }
     unique_fd readyRead(pp[0]), readyWrite(pp[1]);
+    mLost.erase(k);
+    mAttached.insert(k);
+    if (conn) mFuseConn[k] = conn;
+    auto retireFailedAttach = [&] {
+        if (prepareDetach(p) != OK) return false;
+        umount2(target.c_str(), MNT_DETACH);
+        detach(p, false);
+        return true;
+    };
     int value = -1;
     status_t res = request(StringPrintf("ATTACH %d %u %u %d %s %s", k, gid, ownerUid, fixedReadOnly ? 1 : 0,
                                         p.fsType.c_str(), volumeId.c_str()),
@@ -585,12 +621,9 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
     readyWrite.reset();
     if (res != OK || value != 0) {
         LOG(ERROR) << "fsvm: the drive's fsvmd did not take " << volumeId << " (" << res << ", " << value << ")";
-        umount2(target.c_str(), MNT_DETACH);
-        endIfIdle();
+        retireFailedAttach();
         return -EIO;
     }
-    mLost.erase(k);
-    mAttached.insert(k);
     // The VM starts with the first partition, and each partition's session mounts it: as for a volume of its own.
     struct pollfd pfd = {readyRead.get(), POLLIN, 0};
     char c = 0;
@@ -601,7 +634,6 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
         if (servedReadOnly) *servedReadOnly = fixedReadOnly || c == 'r' || c == 'c';
         if (checking) *checking = !fixedReadOnly && c == 'c';
         *serving = sNextServing--;
-        if (conn) mFuseConn[k] = conn;
         LOG(INFO) << "fsvm: " << volumeId << " served by its drive's VM, disk " << k
                   << (c == 'c' ? ", read-only while the VM checks it" : "");
         unique_fd watch = Connection(mPid);
@@ -613,8 +645,7 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
         return OK;
     }
     // N: the drive's VM was refused at its start for want of memory.
-    detach(p, false);
-    umount2(target.c_str(), MNT_DETACH);
+    if (!retireFailedAttach()) return -EIO;
     if (c == 'N') {
         NoRoomForDrive();
         LOG(WARNING) << "fsvm: no protected VM place for " << volumeId << ": its drive's VM was refused at its start";
@@ -626,23 +657,33 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
 
 int Drive::detach(const Part& p, bool orderly) {
     const int k = indexOf(p);
-    // Served when the drive's fsvmd ended, was ended or killed: nothing says it was written back.
-    if (k >= 0 && mLost.erase(k)) return -1;
+    // The caller checked the identity or isolated the original backing before disconnecting FUSE.
+    if (k >= 0 && mLost.erase(k)) {
+        mAttached.erase(k);
+        mFuseConn.erase(k);
+        endIfIdle();
+        return -1;
+    }
     if (k < 0 || !mAttached.count(k) || mPid <= 0) return 0;
+    const bool fenced = mRanges[k].fenceStarted;
     mFuseConn.erase(k);
     int value = -1;
     status_t res = request(StringPrintf("DETACH %d %d", k, orderly ? 1 : 0), {}, 'D', k, true,
                            orderly ? kSyncMs : kTermMs + kKillMs, &value);
     mAttached.erase(k);
+    mLost.erase(k);
     endIfIdle();
+    if (fenced) return kExitNotWrittenBack;
     if (res != OK) return -1;
     // 1: never served, 5: its VM never started. Nothing was written to it.
     if (value == 0 || value == 1 || value == kExitNoRoom) return 0;
     return value == kExitNotWrittenBack ? kExitNotWrittenBack : -1;
 }
 
-status_t Drive::format(const Part& p, const std::string& fsType, Part* out, bool* recheck) {
+status_t Drive::format(const Part& p, const std::string& fsType, Part* out, bool* recheck,
+                       bool* writerStopped) {
     *recheck = false;
+    *writerStopped = false;
     const int k = indexOf(p);
     if (k < 0 || mAttached.count(k) || (fsType != "vfat" && fsType != "exfat")) return -EIO;
     // Before anything starts or is written: the medium the partition was read from, known, and the disk's size.
@@ -667,6 +708,8 @@ status_t Drive::format(const Part& p, const std::string& fsType, Part* out, bool
             status_t call = request(StringPrintf("FORMAT %d %s", k, fsType.c_str()), {}, 'F', k, true,
                                     kFormatTimeoutMs, &value, &text);
             res = FormatOutcome(call, value, text, p, fsType, out, recheck);
+            *writerStopped = call == OK &&
+                    (value == 0 || value == kFormatUnverified || value == kFormatUncertainStopped);
         }
         if (res == OK) {
             mParts[k] = *out;
@@ -684,20 +727,29 @@ void Drive::holdForRepair() {
     mBusy++;
 }
 
+bool Drive::hasUnfinishedMutation() {
+    mControl.settle();
+    return mBusy > 0 || mControl.hasPending();
+}
+
 void Drive::repairEnded() {
     if (mBusy > 0) mBusy--;
     endIfIdle();
 }
 
+bool Drive::prepareRepair(const Part& p) {
+    return mayErase(p);
+}
+
 pid_t Drive::startRepair(const Part& p) {
     const int k = indexOf(p);
-    if (k < 0 || mPid <= 0 || mAttached.count(k)) return -1;
+    if (k < 0 || mPid <= 0 || mAttached.count(k) || !mayErase(p)) return -1;
     int pp[2];
     if (pipe2(pp, O_CLOEXEC)) return -1;
     unique_fd rd(pp[0]), wr(pp[1]);
     int value = -1;
     mControl.settle();
-    if (mControl.pending(k) ||
+    if (mControl.pending(k) || !mayErase(p) ||
         request(StringPrintf("REPAIR %d", k), {wr.get()}, 'R', k, true, kStartMs, &value) != OK || value != 0) {
         LOG(ERROR) << "fsvm: the drive's fsvmd did not start the repair of partition " << p.index;
         return -1;

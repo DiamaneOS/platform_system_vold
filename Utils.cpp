@@ -17,6 +17,7 @@
 #include "Utils.h"
 
 #include "Process.h"
+#include "fs/Fsvm.h"
 #include "sehandle.h"
 
 #include <android-base/chrono_utils.h>
@@ -1503,7 +1504,11 @@ status_t AbortFuseConnections() {
 
         std::string abortPath = itEntry.path().string() + "/abort";
         LOG(DEBUG) << "Aborting fuse connection entry " << abortPath;
+#ifdef VOLD_PUBLIC_FS_IN_VM  // DiamaneOS: raw drive FUSE is closed only after teardown preflight.
+        bool ret = fsvm::AbortUnprotectedFuse(abortPath);
+#else
         bool ret = writeStringToFile("1", abortPath);
+#endif
         if (!ret) {
             LOG(WARNING) << "Failed to write to " << abortPath;
         }

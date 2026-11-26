@@ -24,6 +24,7 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <libdm/dm.h>
+#include <linux/dm-ioctl.h>
 #include <packagelistparser/packagelistparser.h>
 #include <private/android_filesystem_config.h>
 
@@ -51,6 +52,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <map>
 #include <functional>
 #include <map>
 #include <memory>
@@ -157,10 +160,10 @@ static std::map<pid_t, unique_fd> sRepairPipes;
 static constexpr const char* kPoolDir = "/sys/class/misc/gunyah_vm_pool/";
 /* What a VM of vold's takes from the pool besides its RAM: the firmware region and its bounce buffers. */
 static constexpr uint64_t kVmExtraMiB = 4 + 6;
-/* fsvmd's largest VM (fsvm proto layout.rs MAX_SERVE_MIB). Its smallest are kProbeVmMib and kServeVmMib (PROBE_MIB
- * and MIN_SERVE_MIB): a volume's VM may be larger, and falls back to the smallest serving VM when that does not
- * start. */
-static constexpr uint64_t kMaxVmMiB = 256;
+/* fsvmd's largest VM (fsvm proto layout.rs MAX_SERVE_MIB): the largest that starts beside the decode service's VM in
+ * the pool. Its smallest are kProbeVmMib and kServeVmMib (PROBE_MIB and MIN_SERVE_MIB): a volume's VM may be larger,
+ * and falls back to the smallest serving VM when that does not start. */
+static constexpr uint64_t kMaxVmMiB = 204;
 
 uint64_t ObbVmMib(uint64_t diskBytes) {
     // fsvmd main.rs obb_memory_mib: the probe VM's size up to 2 GiB, a serving VM's least above.
@@ -181,24 +184,21 @@ static bool ReadPoolValue(const char* name, uint64_t* value) {
     return android::base::ParseUint(android::base::Trim(text), value);
 }
 
-/* The pieces an ordinary-memory VM of `mib` MiB is likely to take: about one per two pages once free memory is
- * scattered, plus its firmware region and bounce buffers (1024 and 1536 pages at most). A hint only. */
-static uint64_t OrdinaryPieces(uint64_t mib) {
-    return std::min<uint64_t>(20000, mib * 256 / 2 + 1024 + 1536);
-}
-
-/* Whether a VM of `mib` MiB may start now, and why not in `why`. A kernel without the pool or its piece count leaves
- * the decision to the start itself. */
+/* Whether a VM of `mib` MiB may start now, and why not in `why`: room in the pool, or else ordinary memory while the
+ * kernel's real count of pieces of all VMs has room. The kernel makes an ordinary-memory VM's file in large blocks,
+ * counts its pieces and refuses it when they pass vm_pieces_max, and a VM refused at its start waits for room like
+ * one refused here. A kernel without the pool or its piece count leaves the decision to the start itself. */
 static bool RoomFor(uint64_t mib, std::string* why) {
-    uint64_t freeBytes = 0, pieces = 0, max = 0;
+    uint64_t freeBytes = 0, reserved = 0, pieces = 0, max = 0;
     const bool pool = ReadPoolValue("free_bytes", &freeBytes);
+    // The room the pool keeps for the decode service's VM while that VM is not in it (kernel reserved_bytes).
+    ReadPoolValue("reserved_bytes", &reserved);
+    freeBytes = freeBytes > reserved ? freeBytes - reserved : 0;
     if (pool && freeBytes >= (mib + kVmExtraMiB) << 20) return true;
     if (!ReadPoolValue("vm_pieces", &pieces) || !ReadPoolValue("vm_pieces_max", &max)) return true;
-    const uint64_t need = OrdinaryPieces(mib);
-    if (pieces + need <= max) return true;
+    if (pieces < max) return true;
     *why = "the pool has " + std::to_string(freeBytes >> 20) + " MiB free of " + std::to_string(mib + kVmExtraMiB) +
-           " MiB needed, and ordinary memory would take about " + std::to_string(need) + " pieces with " +
-           std::to_string(pieces) + " of " + std::to_string(max) + " in use";
+           " MiB needed, and all VMs hold " + std::to_string(pieces) + " of " + std::to_string(max) + " pieces";
     return false;
 }
 /* A drive waits for room: OBB images then never take room before it. */
@@ -710,6 +710,49 @@ status_t MountFuse(const std::string& target, gid_t gid, bool readOnly, unique_f
     return OK;
 }
 
+// This lock is independent of vold's volume lock. Global abort is used when a volume operation is stuck.
+static std::mutex sDriveFuseLock;
+static std::map<std::string, unique_fd> sDriveFuse;
+
+static bool SameFuseAbortFile(const struct stat& held, const struct stat& candidate) {
+    return held.st_dev == candidate.st_dev && held.st_ino == candidate.st_ino;
+}
+
+bool ProtectDriveFuse(unsigned connection) {
+    if (!connection) return false;
+    const auto path = StringPrintf("/sys/fs/fuse/connections/%u/abort", connection);
+    std::lock_guard<std::mutex> lock(sDriveFuseLock);
+    for (auto it = sDriveFuse.begin(); it != sDriveFuse.end();) {
+        struct stat held, now;
+        // A failed lookup leaves the original pin in place.
+        if (fstat(it->second.get(), &held) == 0 &&
+            (held.st_nlink == 0 ||
+             (lstat(it->first.c_str(), &now) == 0 && !SameFuseAbortFile(held, now)))) {
+            it = sDriveFuse.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Keep the old inode distinct even if the kernel later reuses the numeric connection ID.
+    unique_fd abortFile(TEMP_FAILURE_RETRY(open(path.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW)));
+    if (abortFile < 0) return false;
+    sDriveFuse.insert_or_assign(path, std::move(abortFile));
+    return true;
+}
+
+bool AbortUnprotectedFuse(const std::string& abortPath) {
+    std::lock_guard<std::mutex> lock(sDriveFuseLock);
+    unique_fd fd(TEMP_FAILURE_RETRY(open(abortPath.c_str(), O_WRONLY | O_CLOEXEC | O_NOFOLLOW)));
+    struct stat candidate;
+    if (fd < 0 || fstat(fd.get(), &candidate) != 0) return false;
+    auto protectedFile = sDriveFuse.find(abortPath);
+    if (protectedFile != sDriveFuse.end()) {
+        struct stat held;
+        if (fstat(protectedFile->second.get(), &held) != 0 || SameFuseAbortFile(held, candidate)) return true;
+    }
+    return android::base::WriteStringToFd("1", fd.get());
+}
+
 status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly, bool* checking) {
     if (servedReadOnly) *servedReadOnly = false;
     if (checking) *checking = false;
@@ -907,16 +950,18 @@ ProbeMemory::Next ProbeMemory::next(const std::string& seq, uint64_t size, int64
 }
 
 bool ProbeMemory::took(const std::string& seq, uint64_t size, int64_t nowMs) {
-    const bool other = !holds(seq, size);
+    const bool known = !android::base::Trim(seq).empty();
+    const bool other = mProbed && known && !android::base::Trim(mSeq).empty() &&
+                       android::base::Trim(seq) != android::base::Trim(mSeq);
     mProbed = true;
-    mSeq = seq;
+    if (known) mSeq = seq;
     mSize = size;
     mAtMs = nowMs;
     return other;
 }
 
 bool ProbeMemory::holds(const std::string& seq, uint64_t size) const {
-    return !mProbed || (seq == mSeq && size == mSize);
+    return !mProbed || (android::base::Trim(seq) == android::base::Trim(mSeq) && size == mSize);
 }
 
 void SetPlaceHooks(std::function<bool()> stopObbForDrive, std::function<void()> onPlaceFree) {
@@ -1123,22 +1168,65 @@ void DeleteRangesOf(dev_t disk) {
     });
 }
 
-void FailRangesOf(dev_t disk) {
-    auto& dm = android::dm::DeviceMapper::Instance();
-    ForEachRange(RangePrefix(disk), [&dm](const std::string& name) {
-        std::vector<android::dm::DeviceMapper::TargetInfo> targets;
-        uint64_t sectors = 0;
-        if (dm.GetTableInfo(name, &targets)) {
-            for (const auto& t : targets) sectors = std::max<uint64_t>(sectors, t.spec.sector_start + t.spec.length);
-        }
-        android::dm::DmTable table;
-        if (!sectors || !table.Emplace<android::dm::DmTargetError>(0, sectors) ||
-            !dm.LoadTableAndActivate(name, table)) {
-            PLOG(ERROR) << "fsvm: the range " << name << " could not be cut off from the changed medium";
-            return;
-        }
-        LOG(WARNING) << "fsvm: the medium changed, the range " << name << " fails all I/O now";
-    });
+android::base::unique_fd OpenRange(const std::string& node, dev_t expected, bool readOnly) {
+    android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(node.c_str(), (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC)));
+    struct stat st;
+    if (fd < 0 || fstat(fd.get(), &st) != 0 || !S_ISBLK(st.st_mode) || st.st_rdev != expected) return {};
+    return fd;
+}
+
+status_t FenceRange(RangeBacking* range) {
+    range->fenceStarted = true;
+    struct stat st;
+    if (fstat(range->fd.get(), &st) != 0 || !S_ISBLK(st.st_mode) || !range->sectors) return -ENODEV;
+    android::base::unique_fd control(TEMP_FAILURE_RETRY(open("/dev/device-mapper", O_RDWR | O_CLOEXEC)));
+    if (control < 0) return -errno;
+
+    // The held block descriptor prevents the device number from being reused.
+    struct TableIoctl {
+        dm_ioctl header;
+        dm_target_spec target;
+        char params[8];
+    };
+    auto init = [&](TableIoctl* data, uint32_t flags) {
+        *data = {};
+        data->header.version[0] = DM_VERSION_MAJOR;
+        data->header.data_size = sizeof(*data);
+        data->header.data_start = offsetof(TableIoctl, target);
+        data->header.dev = st.st_rdev;
+        data->header.flags = flags;
+    };
+    auto fenced = [&] {
+        TableIoctl status;
+        init(&status, DM_STATUS_TABLE_FLAG | DM_NOFLUSH_FLAG);
+        constexpr uint32_t kUnsafeFlags = DM_BUFFER_FULL_FLAG | DM_SUSPEND_FLAG | DM_INTERNAL_SUSPEND_FLAG |
+                                          DM_INACTIVE_PRESENT_FLAG;
+        return ioctl(control.get(), DM_TABLE_STATUS, &status) == 0 &&
+               status.header.dev == static_cast<uint64_t>(st.st_rdev) &&
+               range->name == status.header.name && status.header.target_count == 1 &&
+               (status.header.flags & DM_ACTIVE_PRESENT_FLAG) && !(status.header.flags & kUnsafeFlags) &&
+               status.header.data_start == offsetof(TableIoctl, target) &&
+               status.header.data_size >= offsetof(TableIoctl, params) &&
+               status.target.sector_start == 0 && status.target.length == range->sectors &&
+               strcmp(status.target.target_type, "error") == 0;
+    };
+    if (fenced()) return OK;
+
+    TableIoctl load;
+    init(&load, range->readOnly ? DM_READONLY_FLAG : 0);
+    load.header.target_count = 1;
+    load.target.length = range->sectors;
+    load.target.next = sizeof(load.target) + sizeof(load.params);
+    memcpy(load.target.target_type, "error", sizeof("error"));
+    if (ioctl(control.get(), DM_TABLE_LOAD, &load) != 0) return -errno;
+
+    // Activating a loaded table normally suspends it with a filesystem lock and flush.
+    TableIoctl resume;
+    init(&resume, DM_SKIP_LOCKFS_FLAG | DM_NOFLUSH_FLAG);
+    if (ioctl(control.get(), DM_DEV_SUSPEND, &resume) != 0) return -errno;
+    if (!fenced()) return -EIO;
+    LOG(WARNING) << "fsvm: the original backing " << range->name << " now fails all I/O";
+    return OK;
 }
 
 void SweepRanges() {
@@ -1208,10 +1296,61 @@ bool IsMedium(dev_t disk, const std::string& seq) {
     return !now.empty() && now == android::base::Trim(seq);
 }
 
+bool MediumChanged(dev_t disk, const std::string& seq) {
+    std::string now;
+    return !android::base::Trim(seq).empty() &&
+           android::base::ReadFileToString(StringPrintf("/sys/dev/block/%u:%u/diskseq", major(disk), minor(disk)), &now) &&
+           !android::base::Trim(now).empty() && android::base::Trim(now) != android::base::Trim(seq);
+}
+
 bool HasSize(dev_t disk, uint64_t bytes) {
     uint64_t sectors = 0;
     return ReadNumber(StringPrintf("/sys/dev/block/%u:%u/size", major(disk), minor(disk)), &sectors) &&
            sectors <= UINT64_MAX / 512 && sectors * 512 == bytes;
+}
+
+bool FencesMedium(dev_t disk) {
+    // MMC removes the card's gendisk and queue on removal. A SCSI reader may keep both for another card.
+    return major(disk) == 179;
+}
+
+bool EraseDescriptor(int fd, dev_t disk, uint64_t bytes, const std::string& seq) {
+    uint64_t generation = 0, expected = 0, size = 0;
+    struct stat st;
+    return FencesMedium(disk) && ParseUint(android::base::Trim(seq), &expected) && expected != 0 &&
+           fstat(fd, &st) == 0 && S_ISBLK(st.st_mode) && st.st_rdev == disk &&
+           ioctl(fd, BLKGETDISKSEQ, &generation) == 0 && generation == expected &&
+           GetBlockDevSize(fd, &size) == OK && size == bytes && IsMedium(disk, seq) && HasSize(disk, bytes);
+}
+
+bool ReprobeOnMount(bool unread, bool explicitRetry) {
+    return unread && explicitRetry;
+}
+
+bool MatchesTable(const Layout& layout, const TableRequest& request, const Table& table) {
+    const bool mbr = table.head.size() > 450 && table.head[450] != 0xee;
+    if (layout.table != (mbr ? "mbr" : "gpt") || layout.diskBytes != request.diskBytes ||
+        layout.parts.size() != table.parts.size()) return false;
+    const uint64_t scale = request.blockSize / 512;
+    for (size_t i = 0; i < table.parts.size(); i++) {
+        const auto& p = layout.parts[i];
+        const auto& e = table.parts[i];
+        Part::Class cls = Part::Class::kPublic;
+        if (request.kind != TableKind::kPublic) {
+            const size_t meta = request.kind == TableKind::kMixed ? 1 : 0;
+            if (i == meta) cls = Part::Class::kMeta;
+            if (i > meta) cls = Part::Class::kExpand;
+        }
+        if (p.index != i + 1 || p.cls != cls || p.start != e.first * scale ||
+            p.length != (e.last - e.first + 1) * scale) return false;
+        if (!mbr) {
+            Guid guid;
+            if (i >= request.partGuids.size() || !ParseGuid(p.partGuid, &guid) || guid != request.partGuids[i]) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 status_t OpenToErase(const std::string& path, dev_t disk, uint64_t bytes, const std::string& seq, unique_fd* fd,
@@ -1219,7 +1358,7 @@ status_t OpenToErase(const std::string& path, dev_t disk, uint64_t bytes, const 
     fd->reset();
     *blockSize = 0;
     // The identity first: nothing is opened for writing on a medium other than the one the user chose.
-    if (!IsMedium(disk, seq)) {
+    if (!FencesMedium(disk) || !IsMedium(disk, seq) || !HasSize(disk, bytes)) {
         LOG(ERROR) << "fsvm: " << path << " does not hold the medium it was read from, not erasing it";
         return -ENODEV;
     }
@@ -1238,7 +1377,7 @@ status_t OpenToErase(const std::string& path, dev_t disk, uint64_t bytes, const 
         return -ENODEV;
     }
     // Opened while it still held that medium: everything that follows goes through this descriptor.
-    if (!IsMedium(disk, seq)) {
+    if (!EraseDescriptor(f.get(), disk, bytes, seq)) {
         LOG(ERROR) << "fsvm: the medium of " << path << " changed while it was opened, not erasing it";
         return -ENODEV;
     }
@@ -1247,7 +1386,7 @@ status_t OpenToErase(const std::string& path, dev_t disk, uint64_t bytes, const 
     return OK;
 }
 
-status_t WriteTable(int fd, const Table& t) {
+status_t WriteTable(int fd, const Table& t, const std::function<bool()>& mayWrite) {
     // The end first, then the start, as sgdisk writes a GPT (UEFI's order), each a MiB of zeros with the table's
     // sectors: the old tables go with them. O_DIRECT wants aligned memory.
     static constexpr size_t kMiB = 1 << 20;
@@ -1259,12 +1398,14 @@ status_t WriteTable(int fd, const Table& t) {
         memcpy(buf.get(), bytes->data(), kMiB);
         size_t done = 0;
         while (done < kMiB) {
+            if (!mayWrite()) return -ENODEV;
             ssize_t n = TEMP_FAILURE_RETRY(
                     pwrite(fd, static_cast<char*>(buf.get()) + done, kMiB - done, at + done));
             if (n <= 0) return n < 0 ? -errno : -EIO;
             done += n;
         }
     }
+    if (!mayWrite()) return -ENODEV;
     return fsync(fd) ? -errno : OK;
 }
 

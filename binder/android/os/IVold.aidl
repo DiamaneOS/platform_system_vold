@@ -159,6 +159,10 @@ interface IVold {
 
     const int FSTRIM_FLAG_DEEP_TRIM = 1;
 
+    // DiamaneOS: host-enforced read-only, retained through retries.
+    const int MOUNT_FLAG_READ_ONLY = 8;
+    // DiamaneOS: one explicit Mount request may re-read an unread placeholder.
+    const int MOUNT_FLAG_RESCAN = 16;
     const int MOUNT_FLAG_PRIMARY = 1;
     const int MOUNT_FLAG_VISIBLE_FOR_READ = 2;
     const int MOUNT_FLAG_VISIBLE_FOR_WRITE = 4;
@@ -191,6 +195,9 @@ interface IVold {
     const int VOLUME_STATE_NOT_WRITTEN_BACK = 10;
     // DiamaneOS: no protected VM place is free for the volume, it is mounted as soon as one is
     const int VOLUME_STATE_WAITING_FOR_PLACE = 11;
+    // DiamaneOS: mkfs completed and target verification is pending.
+    const int VOLUME_STATE_FORMATTED_UNVERIFIED = 12;
+    const int VOLUME_STATE_FORMAT_RESULT_UNVERIFIED = 13;
 
     const int VOLUME_TYPE_PUBLIC = 0;
     const int VOLUME_TYPE_PRIVATE = 1;
@@ -198,4 +205,16 @@ interface IVold {
     const int VOLUME_TYPE_ASEC = 3;
     const int VOLUME_TYPE_OBB = 4;
     const int VOLUME_TYPE_STUB = 5;
+    // DiamaneOS: the medium selected at confirmation, checked through write and readback.
+    void partitionConfirmed(@utf8InCpp String diskId, int partitionType, int ratio,
+            @utf8InCpp String generation, long sizeBytes);
+    // DiamaneOS: system-server factory reset with a single external-erase deadline.
+    void partitionPublicForReset(@utf8InCpp String diskId, @utf8InCpp String generation,
+            long sizeBytes, long deadlineMillis);
+    // DiamaneOS: a new explicit confirmation for a previously unverified erase.
+    void partitionPublicRetryConfirmed(@utf8InCpp String diskId, @utf8InCpp String generation,
+            long sizeBytes);
+    // DiamaneOS: refuse unsafe removable teardown before the framework closes its storage sessions.
+    void preflightReset();
+
 }

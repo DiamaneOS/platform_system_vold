@@ -63,6 +63,7 @@ class VolumeBase {
     enum MountFlags {
         /* Flag that volume is primary external storage */
         kPrimary = 1 << 0,
+        kReadOnly = 1 << 3,  // DiamaneOS: an explicit request survives volume recreation
         /*
          * Flags indicating that volume is visible to normal apps.
          * kVisibleForRead and kVisibleForWrite correspond to
@@ -89,6 +90,8 @@ class VolumeBase {
         kNotWrittenBack,
         /* DiamaneOS: no protected VM place is free for it, mounted when one is (IVold) */
         kWaitingForPlace,
+        kFormattedUnverified,
+        kFormatResultUnverified,
     };
 
     const std::string& getId() const { return mId; }
@@ -119,10 +122,10 @@ class VolumeBase {
     bool isVisibleForWrite() const { return (mMountFlags & MountFlags::kVisibleForWrite) != 0; }
     bool isVisible() const { return isVisibleForRead() || isVisibleForWrite(); }
 
-    status_t create();
-    status_t destroy();
+    status_t create(bool publishOnFailure = true);
+    status_t destroy(bool stopChecked = false);
     status_t mount();
-    status_t unmount();
+    status_t unmount(bool stopChecked = false);
     status_t format(const std::string& fsType);
 
     virtual std::string getRootPath() const;
