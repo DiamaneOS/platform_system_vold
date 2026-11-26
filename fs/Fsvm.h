@@ -51,6 +51,8 @@ namespace fsvm {
 struct Part {
     /* Only the placeholder of a disk the VM could not read: it says so, and is never mounted or formatted */
     bool unread = false;
+    /* Only the placeholder of a disk whose probe waits for a protected VM place: it says so, and is never mounted */
+    bool waitingForPlace = false;
     enum class Class { kPublic, kMeta, kExpand };
     uint32_t index = 0; /* 0: a filesystem on the whole disk */
     Class cls = Class::kPublic;

@@ -87,6 +87,8 @@ class VolumeBase {
         kUnopenable,
         /* DiamaneOS: unmounted, but the filesystem VM could not write everything back first (IVold) */
         kNotWrittenBack,
+        /* DiamaneOS: no protected VM place is free for it, mounted when one is (IVold) */
+        kWaitingForPlace,
     };
 
     const std::string& getId() const { return mId; }

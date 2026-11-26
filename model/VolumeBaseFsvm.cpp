@@ -30,12 +30,15 @@ VolumeBase::State VolumeBase::reportedState() const {
 
 bool VolumeBase::mayMount() const {
     return mState == State::kUnmounted || mState == State::kUnmountable || mState == State::kUnopenable ||
-           mState == State::kNotWrittenBack || (mState == State::kChecking && waitingForPlace());
+           mState == State::kNotWrittenBack || mState == State::kWaitingForPlace;
 }
 
 void VolumeBase::mountFailed() {
-    // Waiting for a protected VM place: it stays as checking, and is mounted when a place is free.
-    if (waitingForPlace()) return;
+    // Waiting for a protected VM place: it says so, and its disk makes it again when a place is free.
+    if (waitingForPlace()) {
+        setState(State::kWaitingForPlace);
+        return;
+    }
     setState(mountFailedInVm() ? State::kUnopenable : State::kUnmountable);
     onMountFailed();
 }

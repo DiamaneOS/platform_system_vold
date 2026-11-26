@@ -23,6 +23,8 @@
     bool createPublicVolumeInVm(const fsvm::Part& part);
     bool createPrivateVolumeInVm(const fsvm::Part& part);
     void createUnopenableVolume();
+    /* The placeholder of a disk whose probe waits for a protected VM place */
+    void createWaitingVolume();
     void removeRanges();
     /* Asks every volume of the disk to start writing back, before they are stopped one by one */
     void prepareStopAll();
