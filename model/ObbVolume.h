@@ -29,7 +29,8 @@ namespace vold {
  */
 class ObbVolume : public VolumeBase {
   public:
-    ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid);
+    /* DiamaneOS: `user` is the caller's user (ownerGid is a shared app gid, the same in every user) */
+    ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid, userid_t user);
     virtual ~ObbVolume();
 
   protected:
@@ -43,6 +44,9 @@ class ObbVolume : public VolumeBase {
     gid_t mOwnerGid;
 
     std::string mLoopPath;
+
+    /* DiamaneOS: the filesystem VM's members (ObbVolumeFsvm.cpp), private when it ends */
+#include "model/ObbVolumeFsvm.inc"
 
     DISALLOW_COPY_AND_ASSIGN(ObbVolume);
 };

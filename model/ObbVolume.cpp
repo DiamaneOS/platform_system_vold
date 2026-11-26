@@ -18,6 +18,7 @@
 #include "Loop.h"
 #include "Utils.h"
 #include "VoldUtil.h"
+#include "fs/Fsvm.h"
 #include "fs/Vfat.h"
 
 #include <android-base/logging.h>
@@ -38,16 +39,18 @@ using android::base::StringPrintf;
 namespace android {
 namespace vold {
 
-ObbVolume::ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid)
+ObbVolume::ObbVolume(int id, const std::string& sourcePath, gid_t ownerGid, userid_t user)
     : VolumeBase(Type::kObb) {
     setId(StringPrintf("obb:%d", id));
     mSourcePath = sourcePath;
     mOwnerGid = ownerGid;
+    mUser = user;  // DiamaneOS
 }
 
 ObbVolume::~ObbVolume() {}
 
 status_t ObbVolume::doCreate() {
+    DIAMANEOS_FS_IN_VM(return OK;)  // DiamaneOS: the VM reads the image, no loop device
     if (Loop::create(mSourcePath, mLoopPath)) {
         PLOG(ERROR) << getId() << " failed to create loop";
         return -1;
@@ -56,6 +59,7 @@ status_t ObbVolume::doCreate() {
 }
 
 status_t ObbVolume::doDestroy() {
+    DIAMANEOS_FS_IN_VM(return OK;)  // DiamaneOS
     if (!mLoopPath.empty() && Loop::destroyByDevice(mLoopPath.c_str())) {
         PLOG(WARNING) << getId() << " failed to destroy loop";
     }
@@ -64,6 +68,7 @@ status_t ObbVolume::doDestroy() {
 }
 
 status_t ObbVolume::doMount() {
+    DIAMANEOS_FS_IN_VM(return mountInVm();)  // DiamaneOS: ObbVolumeFsvm.cpp
     auto path = StringPrintf("/mnt/obb/%s", getId().c_str());
     setPath(path);
 
@@ -86,6 +91,7 @@ status_t ObbVolume::doUnmount() {
 
     KillProcessesUsingPath(path);
     ForceUnmount(path);
+    DIAMANEOS_FS_IN_VM(stopInVm();)  // DiamaneOS
     rmdir(path.c_str());
 
     return OK;

@@ -45,8 +45,12 @@ namespace android {
 namespace vold {
 
 PrivateVolume::PrivateVolume(dev_t device, const KeyBuffer& keyRaw)
-    : VolumeBase(Type::kPrivate), mRawDevice(device), mKeyRaw(keyRaw) {
-    setId(StringPrintf("private:%u,%u", major(device), minor(device)));
+    : PrivateVolume(device, device, keyRaw) {}
+
+/* DiamaneOS: a range of a card (DiskFsvm.cpp createPrivateVolumeInVm), with the partition's IDs */
+PrivateVolume::PrivateVolume(dev_t device, dev_t idDevice, const KeyBuffer& keyRaw)
+    : VolumeBase(Type::kPrivate), mRawDevice(device), mIdDevice(idDevice), mKeyRaw(keyRaw) {
+    setId(StringPrintf("private:%u,%u", major(idDevice), minor(idDevice)));
     mRawDevPath = StringPrintf("/dev/block/vold/%s", getId().c_str());
 }
 
@@ -181,7 +185,7 @@ void PrivateVolume::doPostMount() {
     // be destroyed during unmount
     for (userid_t user : vol_manager->getStartedUsers()) {
         auto vol = std::shared_ptr<VolumeBase>(
-                new EmulatedVolume(mediaPath, mRawDevice, mFsUuid, user));
+                new EmulatedVolume(mediaPath, mIdDevice, mFsUuid, user));
         vol->setMountUserId(user);
         addVolume(vol);
         vol->create();

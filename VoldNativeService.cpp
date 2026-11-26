@@ -454,13 +454,14 @@ binder::Status VoldNativeService::fixupAppDir(const std::string& path, int32_t a
     return translate(VolumeManager::Instance()->fixupAppDir(path, appUid));
 }
 
-binder::Status VoldNativeService::createObb(const std::string& sourcePath, int32_t ownerGid,
+// DiamaneOS: userId, the caller's user (IVold.aidl)
+binder::Status VoldNativeService::createObb(const std::string& sourcePath, int32_t ownerGid, int32_t userId,
                                             std::string* _aidl_return) {
     ENFORCE_SYSTEM_OR_ROOT;
     CHECK_ARGUMENT_PATH(sourcePath);
     ACQUIRE_LOCK;
 
-    return translate(VolumeManager::Instance()->createObb(sourcePath, ownerGid, _aidl_return));
+    return translate(VolumeManager::Instance()->createObb(sourcePath, ownerGid, userId, _aidl_return));
 }
 
 binder::Status VoldNativeService::destroyObb(const std::string& volId) {

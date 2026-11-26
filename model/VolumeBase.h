@@ -83,6 +83,10 @@ class VolumeBase {
         kUnmountable,
         kRemoved,
         kBadRemoval,
+        /* DiamaneOS: the filesystem VM could not open it (IVold VOLUME_STATE_UNOPENABLE) */
+        kUnopenable,
+        /* DiamaneOS: unmounted, but the filesystem VM could not write everything back first (IVold) */
+        kNotWrittenBack,
     };
 
     const std::string& getId() const { return mId; }
@@ -169,6 +173,9 @@ class VolumeBase {
     std::list<std::shared_ptr<VolumeBase>> mVolumes;
 
     void setState(State state);
+
+    /* DiamaneOS: the filesystem VM's members (VolumeBaseFsvm.cpp), private when it ends */
+#include "model/VolumeBaseFsvm.inc"
 
     DISALLOW_COPY_AND_ASSIGN(VolumeBase);
 };

@@ -11,6 +11,7 @@ cc_test {
     ],
 
     srcs: [
+        "Fsvm_test.cpp", // DiamaneOS: the filesystem VM's parser and checks
         "Utils_test.cpp",
         "VoldNativeServiceValidation_test.cpp",
     ],

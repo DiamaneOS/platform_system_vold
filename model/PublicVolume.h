@@ -18,6 +18,7 @@
 #define ANDROID_VOLD_PUBLIC_VOLUME_H
 
 #include "VolumeBase.h"
+#include "fs/Fsvm.h"
 
 #include <cutils/multiuser.h>
 
@@ -80,6 +81,9 @@ class PublicVolume : public VolumeBase {
     std::string mFsUuid;
     /* User-visible filesystem label */
     std::string mFsLabel;
+
+    /* DiamaneOS: the filesystem VM's members (PublicVolumeFsvm.cpp), private when it ends */
+#include "model/PublicVolumeFsvm.inc"
 
     DISALLOW_COPY_AND_ASSIGN(PublicVolume);
 };

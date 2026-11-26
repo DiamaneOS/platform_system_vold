@@ -4,6 +4,7 @@ package {
 
 cc_defaults {
     name: "vold_default_flags",
+    defaults: ["vold_fs_in_vm_defaults"], // DiamaneOS: the filesystem VM's build switch (diamaneos/Android.bp)
 
     cflags: [
         "-Wall",
@@ -149,14 +150,19 @@ cc_library_static {
         "fs/Exfat.cpp",
         "fs/Ext4.cpp",
         "fs/F2fs.cpp",
+        "fs/Fsvm.cpp",
         "fs/Vfat.cpp",
         "model/Disk.cpp",
+        "model/DiskFsvm.cpp",
         "model/EmulatedVolume.cpp",
         "model/ObbVolume.cpp",
+        "model/ObbVolumeFsvm.cpp",
         "model/PrivateVolume.cpp",
         "model/PublicVolume.cpp",
+        "model/PublicVolumeFsvm.cpp",
         "model/StubVolume.cpp",
         "model/VolumeBase.cpp",
+        "model/VolumeBaseFsvm.cpp",
         "model/VolumeEncryption.cpp",
     ],
     shared_libs: [
