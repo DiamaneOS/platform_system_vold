@@ -1235,7 +1235,14 @@ int VolumeManager::destroyObb(const std::string& volId) {
     auto i = mObbVolumes.begin();
     while (i != mObbVolumes.end()) {
         if ((*i)->getId() == volId) {
-            (*i)->destroy();
+            // DiamaneOS: a failed native unmount is not a confirmed terminal cleanup.
+            if ((*i)->getState() == VolumeBase::State::kMounted) {
+                status_t res = (*i)->unmount();
+                if (res != OK) return res;
+            }
+            DIAMANEOS_FS_IN_VM(if (status_t res = static_cast<android::vold::ObbVolume*>((*i).get())->cleanupInVm(); res != OK) return res;)  // DiamaneOS
+            status_t res = (*i)->destroy();
+            if (res != OK) return res;
             i = mObbVolumes.erase(i);
         } else {
             ++i;
