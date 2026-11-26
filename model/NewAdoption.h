@@ -37,7 +37,8 @@ namespace vold {
  */
 constexpr bool kNewAdoptableStorage = false;
 
-inline int RefuseNewAdoption(const std::string& diskId) {
+// Out of line, so the refusal stays a call in partitionMixed's code (checked in the built image).
+[[gnu::noinline]] inline int RefuseNewAdoption(const std::string& diskId) {
     LOG(WARNING) << diskId << ": not partitioned as adoptable storage, new adoptable storage is off";
     return -EPERM;
 }
