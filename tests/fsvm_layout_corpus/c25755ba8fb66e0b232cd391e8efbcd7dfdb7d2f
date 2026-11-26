@@ -1,0 +1,5 @@
+FSèff592
+LAYOUT 1 mbr 2
+PART 1 public 4 6 vfat 6FFF-FAB8 - 6 434aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+PART 1 public 4 6 vfat 6FFF-FAB8 - 6 434aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4
+END

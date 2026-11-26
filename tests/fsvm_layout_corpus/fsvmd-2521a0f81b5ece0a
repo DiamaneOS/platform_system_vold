@@ -1,0 +1,8 @@
+FSVMD-OUTPUT 758206976 512 1d7d29001dd3bdf2
+LAYOUT 1 mbr 5
+PART 1 public 49987 182307 vfat - - 0 -
+PART 2 public 232294 182342 vfat - - 49601 -
+PART 3 public 414636 182307 vfat C1C1-C300 - 0 -
+PART 4 public 596943 182342 vfat - - 49601 -
+PART 5 public 779285 701588 vfat - - 0 -
+END

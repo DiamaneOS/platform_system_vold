@@ -44,3 +44,43 @@ cc_fuzz {
         ],
     },
 }
+
+// DiamaneOS: fsvmd's probe report as vold reads it (fs/Fsvm.cpp ParseLayout, the code itself, see
+// vold_fsvm_layout_parser), on the host. Every report fsvmd writes from a layout it accepted (the corpus's
+// FSVMD-OUTPUT files, from vendor/diamaneos fsvm/fuzz) must be accepted, and everything accepted must stay within the
+// disk, clear of the partition tables, without overlaps or control characters.
+cc_defaults {
+    name: "vold_fsvm_layout_fuzz_defaults",
+    srcs: ["FsvmLayoutFuzzer.cpp"],
+    generated_headers: ["vold_fsvm_layout_parser"],
+    include_dirs: ["system/vold"],
+    header_libs: [
+        "libcutils_headers",
+        "libutils_headers",
+    ],
+    static_libs: [
+        "libbase",
+        "liblog",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
+
+cc_fuzz {
+    name: "vold_fsvm_layout_fuzzer",
+    defaults: ["vold_fsvm_layout_fuzz_defaults"],
+    host_supported: true,
+    device_supported: false,
+    corpus: ["fsvm_layout_corpus/*"],
+}
+
+cc_test_host {
+    name: "vold_fsvm_layout_corpus_test",
+    defaults: ["vold_fsvm_layout_fuzz_defaults"],
+    srcs: ["FsvmLayoutReplay.cpp"],
+    cflags: ["-DFSVM_LAYOUT_REPLAY"],
+    data: ["fsvm_layout_corpus/*"],
+    test_suites: ["general-tests"],
+}

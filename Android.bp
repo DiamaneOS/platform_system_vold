@@ -298,3 +298,19 @@ cc_aconfig_library {
     name: "vold_flags_c_lib",
     aconfig_declarations: "vold_flags",
 }
+
+// DiamaneOS: vold's parser of fsvmd's probe report (fs/Fsvm.cpp ParseLayout with its constants and helpers), cut
+// out of the file as it is for the host fuzzer and its corpus test (tests/FsvmLayoutFuzzer.cpp). The build fails when
+// the cut misses a piece, so a rename cannot leave the fuzzer on nothing.
+genrule {
+    name: "vold_fsvm_layout_parser",
+    srcs: ["fs/Fsvm.cpp"],
+    out: ["FsvmLayoutParser.inc"],
+    cmd: "sed -n -E " +
+        "-e '/^static constexpr [a-z0-9_]+ kMax(ProbeOutput|Parts|Index|LabelBytes) =/p' " +
+        "-e '/^static bool IsHex\\(/,/^uint32_t BlockSize\\(/{/^uint32_t BlockSize\\(/!p;}' " +
+        "-e '/^status_t ParseLayout\\(/,/^\\}/p' $(in) > $(out)" +
+        " && grep -q '^status_t ParseLayout(' $(out) && grep -q '^static bool DecodeLabel(' $(out)" +
+        " && test $$(grep -c 'kMax[A-Za-z]* =' $(out)) -eq 4",
+    visibility: ["//system/vold/tests"],
+}

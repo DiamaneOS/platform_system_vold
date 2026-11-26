@@ -1,0 +1,6 @@
+FSVMD-OUTPUT 562949953421312 512 af919d9f43c81d9c
+LAYOUT 1 mbr 3
+PART 1 public 48 1729 exfat - - 0 -
+PART 2 public 1777 1099511625959 vfat - - 0 -
+PART 3 public 1099511627736 40 exfat - - 0 -
+END
