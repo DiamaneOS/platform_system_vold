@@ -432,6 +432,7 @@ status_t Drive::start() {
         mNodes.push_back(node);
         fds.push_back(std::move(fd));
     }
+    mReadOnly = readOnly;
     std::vector<std::string> args = {"--drive", mDiskId, "--block-size", std::to_string(blockSize)};
     for (const auto& d : disks) {
         args.push_back("--disk");
@@ -539,12 +540,11 @@ void Drive::kill() {
 
 void Drive::requestWriteBack() {
     if (mPid <= 0 || mAttached.empty()) return;
-    unique_fd conn = Connection(mPid);
-    if (conn >= 0) Tell(conn.get(), 'W');
+    RequestWriteBack(mPid);
 }
 
 status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::string& volumeId,
-                       const std::string& target, pid_t* serving, bool* servedReadOnly) {
+                       const std::string& target, bool readOnly, pid_t* serving, bool* servedReadOnly) {
     *serving = 0;
     if (servedReadOnly) *servedReadOnly = false;
     const int k = indexOf(p);
@@ -560,8 +560,10 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
         endIfIdle();
         return -EIO;
     }
+    // Read-only for good: the kernel's FUSE mount refuses writes itself, whatever the VM would do.
+    const bool fixedReadOnly = readOnly || mReadOnly;
     unique_fd fuse;
-    if (MountFuse(target, gid, false, &fuse) != OK) {
+    if (MountFuse(target, gid, fixedReadOnly, &fuse) != OK) {
         endIfIdle();
         return -EIO;
     }
@@ -574,8 +576,8 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
     }
     unique_fd readyRead(pp[0]), readyWrite(pp[1]);
     int value = -1;
-    status_t res = request(StringPrintf("ATTACH %d %u %u 0 %s %s", k, gid, ownerUid, p.fsType.c_str(),
-                                        volumeId.c_str()),
+    status_t res = request(StringPrintf("ATTACH %d %u %u %d %s %s", k, gid, ownerUid, fixedReadOnly ? 1 : 0,
+                                        p.fsType.c_str(), volumeId.c_str()),
                            {fuse.get(), readyWrite.get()}, 'A', k, true, kStartMs, &value);
     fuse.reset();
     readyWrite.reset();
@@ -592,8 +594,9 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
     char c = 0;
     if (TEMP_FAILURE_RETRY(poll(&pfd, 1, kReadyTimeoutMs)) == 1 &&
         TEMP_FAILURE_RETRY(read(readyRead.get(), &c, 1)) == 1 && (c == 'R' || c == 'r' || c == 'c')) {
-        // r and c: served read-only, by the VM or while it checks the partition, then W or F (Watch).
-        if (servedReadOnly) *servedReadOnly = c == 'r' || c == 'c';
+        // r and c: served read-only, by the VM or while it checks the partition, then W or F (Watch). R: as asked,
+        // which is read-only when it was asked so.
+        if (servedReadOnly) *servedReadOnly = fixedReadOnly || c == 'r' || c == 'c';
         *serving = sNextServing--;
         if (conn) mFuseConn[k] = conn;
         LOG(INFO) << "fsvm: " << volumeId << " served by its drive's VM, disk " << k

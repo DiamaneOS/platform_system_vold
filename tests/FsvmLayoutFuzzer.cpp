@@ -16,11 +16,11 @@
 
 /*
  * Fuzz target: vold's reading of fsvmd's probe report (fs/Fsvm.cpp ParseLayout and its helpers, compiled from the
- * file itself through the vold_fsvm_layout_parser rule). vold adds kernel partitions from these numbers, so whatever it
- * accepts must stay inside the disk and clear of the partition tables, without overlaps, with at most one adoptable
- * storage pair and printable labels. An input "FSVMD-OUTPUT <disk bytes> <block size> <hash>\n" followed by the
- * report, the hash the FNV-1a of "<disk bytes> <block size>\n" and the report, is one fsvmd wrote from a layout it
- * accepted (vendor/diamaneos fsvm/fuzz): vold must accept it, with the same partitions (a mutated report no longer
+ * file itself through the vold_fsvm_layout_parser rule). vold sets up device-mapper ranges from these numbers, so
+ * whatever it accepts must stay inside the disk and clear of the partition tables, without overlaps, with at most one
+ * adoptable storage pair and printable labels. An input "FSVMD-OUTPUT <disk bytes> <block size> <hash>\n" followed by
+ * the report, the hash the FNV-1a of "<disk bytes> <block size>\n" and the report, is one fsvmd wrote from a layout
+ * it accepted (vendor/diamaneos fsvm/fuzz): vold must accept it, with the same partitions (a mutated report no longer
  * matches its hash). Any other input is eight bytes of disk size, a byte for the block size, then the report.
  */
 

@@ -267,7 +267,6 @@ status_t VolumeBase::format(const std::string& fsType) {
         unmount();
     }
 
-    // DiamaneOS: never a volume the filesystem VM could not open (kUnopenable), as the user decided.
     if ((mState != State::kUnmounted) && (mState != State::kUnmountable)) {
         LOG(WARNING) << getId() << " format requires state unmounted or unmountable";
         return -EBUSY;

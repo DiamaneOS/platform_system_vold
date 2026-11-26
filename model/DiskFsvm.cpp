@@ -21,17 +21,21 @@
  */
 
 #include "Disk.h"
+#include "KeyBuffer.h"
 #include "ObbVolume.h"
 #include "PrivateVolume.h"
 #include "PublicVolume.h"
+#include "RandUtils.h"
 #include "Utils.h"
 #include "VolumeBase.h"
+#include "VolumeEncryption.h"
 #include "VolumeManager.h"
 #include "fs/Fsvm.h"
 #include "fs/FsvmDrive.h"
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 
 #include <sys/sysmacros.h>
@@ -46,6 +50,8 @@
 #include <thread>
 
 using android::base::ReadFileToString;
+using android::base::StringPrintf;
+using android::base::WriteStringToFile;
 
 namespace android {
 namespace vold {
@@ -64,23 +70,91 @@ void Disk::prepareStopAll() {
     for (const auto& vol : mVolumes) vol->prepareStop();
 }
 
-status_t Disk::beforePartitionInVm() {
-    if (!isVmDisk()) return OK;
+status_t Disk::partitionInVm(fsvm::TableKind kind, int ratio) {
     // A disk the filesystem VM could not read is never partitioned (formatted), whoever asks: nothing showed that it
     // holds no data.
     if (mProbeFailed) {
         LOG(WARNING) << mId << ": the filesystem VM could not read this disk, not partitioning it";
         return -EBUSY;
     }
+    if (kind == fsvm::TableKind::kMixed && (ratio < 10 || ratio > 90)) {
+        LOG(ERROR) << "Mixed partition ratio must be between 10-90%";
+        return -EINVAL;
+    }
+    // Its volumes are unmounted first, so that a write back that fails shows: a volume whose last writes did not
+    // reach the medium is never erased here. It stays, for a retry or to copy what can be read.
+    for (const auto& vol : mVolumes) {
+        if (vol->getState() == VolumeBase::State::kMounted) vol->unmount();
+    }
+    for (const auto& vol : mVolumes) {
+        if (vol->getState() == VolumeBase::State::kNotWrittenBack || notWrittenBack(vol->getId())) {
+            LOG(ERROR) << mId << ": " << vol->getId() << " was not written back, not erasing the disk";
+            return -EBUSY;
+        }
+    }
+    if (!mNotWrittenBack.empty()) {
+        LOG(ERROR) << mId << ": " << *mNotWrittenBack.begin() << " was not written back, not erasing the disk";
+        return -EBUSY;
+    }
+    // Only the medium the user chose (the one the last read saw), of its size then: checked before the disk is opened
+    // and after, and everything goes through that descriptor. No partition tool runs here and nothing is read from
+    // the medium: vold builds the table itself (fs/FsvmTable.cpp), as sgdisk wrote it.
+    android::base::unique_fd fd;
+    uint32_t blockSize = 0;
+    if (!mProbe.holds(mProbe.mediumRead(), mSize) ||
+        fsvm::OpenToErase(mDevPath, mDevice, mSize, mProbe.mediumRead(), &fd, &blockSize) != OK) {
+        LOG(ERROR) << mId << ": not the medium that was read, not partitioning it";
+        return -ENODEV;
+    }
+    fsvm::TableRequest r;
+    r.kind = kind;
+    r.diskBytes = mSize;
+    r.blockSize = blockSize;
+    r.ratio = ratio;
+    r.diskGuid = fsvm::RandomGuid();
+    // GUIDs for the partitions before android_expand (a public disk's one, kept only when it needs a GPT).
+    if (kind != fsvm::TableKind::kPrivate) r.partGuids.push_back(fsvm::RandomGuid());
+    // The private partition's GUID and its key, saved before the table is written (Disk::partitionMixed).
+    std::string partGuid;
+    KeyBuffer key;
+    if (kind != fsvm::TableKind::kPublic) {
+        r.partGuids.push_back(fsvm::RandomGuid());
+        std::string partGuidRaw;
+        fsvm::Guid expand;
+        if (GenerateRandomUuid(partGuidRaw) != OK || !generate_volume_key(&key) ||
+            StrToHex(partGuidRaw, partGuid) != OK || !fsvm::ParseGuid(partGuid, &expand)) {
+            LOG(ERROR) << "Failed to generate GUID or key";
+            return -EIO;
+        }
+        r.partGuids.push_back(expand);
+    }
+    fsvm::Table table;
+    if (fsvm::BuildTable(r, &table) != OK) {
+        LOG(ERROR) << mId << ": no table of this layout fits the disk";
+        return -EINVAL;
+    }
+    if (kind != fsvm::TableKind::kPublic) {
+        if (!WriteStringToFile(std::string(key.begin(), key.end()), BuildKeyPath(partGuid))) {
+            LOG(ERROR) << "Failed to persist key";
+            return -EIO;
+        }
+        LOG(DEBUG) << "Persisted key for GUID " << partGuid;
+    }
+    return writeTableInVm(fd.get(), table);
+}
+
+status_t Disk::writeTableInVm(int fd, const fsvm::Table& table) {
     destroyAllVolumes();
     mJustPartitioned = true;
-    // sgdisk then writes the new table. Zeroing the old one first means it never reads a table from the card.
-    if (fsvm::ZeroTables(mDevPath, mSize) != OK) {
-        LOG(ERROR) << "Failed to clear the old partition table";
+    if (status_t res = fsvm::WriteTable(fd, table); res != OK) {
+        LOG(ERROR) << mId << ": the new partition table was not written (" << res << ")";
         mJustPartitioned = false;
-        return -EIO;
+        // What is on the medium now is not known: read it again.
+        readPartitions();
+        return res;
     }
-    return OK;
+    // The filesystem VM reads the new table, and its new volumes are formatted (mJustPartitioned).
+    return readPartitions();
 }
 
 void Disk::beforeDestroyInVm() {
@@ -116,16 +190,24 @@ void Disk::removeRanges() {
     mDrive.reset();
 }
 
-bool Disk::createPublicVolumeInVm(const fsvm::Part& part) {
+bool Disk::createPublicVolumeInVm(const fsvm::Part& part, bool repairFailed) {
     if (mPublicVolumes >= static_cast<int>(kMaxPublicPerDisk)) {
         LOG(WARNING) << mId << ": not serving partition " << part.index << ", " << kMaxPublicPerDisk
                      << " public volumes on this disk already";
         return false;
     }
+    // Its ID (public:179,1) is the disk's minor plus the partition number: never one another disk's volume holds.
+    const std::string volumeId = StringPrintf("public:%u,%u", major(mDevice), minor(mDevice) + part.index);
+    if (VolumeManager::Instance()->findVolume(volumeId)) {
+        LOG(ERROR) << mId << ": " << volumeId << " is another disk's volume, not serving partition " << part.index;
+        return false;
+    }
     mPublicVolumes++;
     // A placeholder (unread, waiting) is never served: no drive.
     auto drive = part.unread ? nullptr : mDrive;
-    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(mDevice, mDevPath, mSysPath, mSize, part, drive));
+    auto pub = std::make_shared<PublicVolume>(mDevice, mDevPath, mSysPath, mSize, part, drive);
+    if (repairFailed) pub->markRepairFailed();
+    std::shared_ptr<VolumeBase> vol = pub;
     // Its disk is known to its format too (a format whose outcome is not read back has the disk read again).
     vol->setDiskId(getId());
     if (mJustPartitioned) {
@@ -142,7 +224,20 @@ bool Disk::createPublicVolumeInVm(const fsvm::Part& part) {
     return true;
 }
 
-bool Disk::createPrivateVolumeInVm(const fsvm::Part& part) {
+bool Disk::createPrivateVolumeInVm(const fsvm::Part& part, int maxMinors) {
+    // The volume's ID and its node's name come from the disk's own minors, as when Android's kernel numbered the
+    // partition (private:179,2): only a partition number the disk has minors for (as for its public partitions), and
+    // never an ID another volume holds, whatever disk it is on.
+    dev_t idDevice;
+    if (!fsvm::PartitionDevice(mDevice, part.index, maxMinors, &idDevice)) {
+        LOG(ERROR) << mId << ": adoptable storage partition " << part.index << " is beyond " << maxMinors;
+        return false;
+    }
+    const std::string volumeId = StringPrintf("private:%u,%u", major(idDevice), minor(idDevice));
+    if (VolumeManager::Instance()->findVolume(volumeId)) {
+        LOG(ERROR) << mId << ": " << volumeId << " is another disk's volume, not setting up its adoptable storage";
+        return false;
+    }
     // Adoptable storage: only a card this phone adopted has a key for its partition GUID. Without one, nothing of the
     // card is set up.
     std::string normalizedGuid;
@@ -162,10 +257,14 @@ bool Disk::createPrivateVolumeInVm(const fsvm::Part& part) {
         return false;
     }
     mRanges.push_back(name);
+    // Its node (/dev/block/vold/private:179,2) is this range's: one left with another device goes first.
+    if (fsvm::ClaimNode("/dev/block/vold/" + volumeId, rangeDevice) != OK) {
+        LOG(ERROR) << mId << ": the node of " << volumeId << " cannot be made for its range";
+        return false;
+    }
     // The volume IDs stay what they were when Android's kernel had the partition (private:179,2).
     auto keyBuffer = KeyBuffer(keyRaw.begin(), keyRaw.end());
-    auto vol = std::shared_ptr<VolumeBase>(
-            new PrivateVolume(rangeDevice, makedev(major(mDevice), minor(mDevice) + part.index), keyBuffer));
+    auto vol = std::shared_ptr<VolumeBase>(new PrivateVolume(rangeDevice, idDevice, keyBuffer));
     if (mJustPartitioned) {
         LOG(DEBUG) << "Device just partitioned; silently formatting";
         vol->setSilent(true);
@@ -197,12 +296,6 @@ void Disk::createUnopenableVolume() {
     whole.length = mSize / 512;
     whole.unread = true;
     createPublicVolumeInVm(whole);
-}
-
-static int64_t BootMs() {
-    struct timespec ts;
-    clock_gettime(CLOCK_BOOTTIME, &ts);
-    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
 }
 
 static void ScheduleReprobe(const std::string& diskId, int delaySeconds, Disk::Reprobe why) {
@@ -303,21 +396,28 @@ void Disk::waitForPlaceDisk(const std::string& diskId) {
 }
 
 void Disk::remakeWaitingVolumes() {
-    std::vector<fsvm::Part> parts;
-    for (auto it = mVolumes.begin(); it != mVolumes.end();) {
+    std::vector<std::string> ids;
+    for (const auto& vol : mVolumes) {
         // No RTTI in vold: the type says which volumes are public ones.
-        if ((*it)->getType() != VolumeBase::Type::kPublic || !(*it)->waitingForPlace()) {
-            ++it;
-            continue;
-        }
-        auto pub = std::static_pointer_cast<PublicVolume>(*it);
-        LOG(INFO) << pub->getId() << ": a protected VM place is free, made again for the framework to mount";
-        parts.push_back(pub->partInVm());
-        pub->destroy();
-        it = mVolumes.erase(it);
-        if (mPublicVolumes > 0) mPublicVolumes--;
+        if (vol->getType() == VolumeBase::Type::kPublic && vol->waitingForPlace()) ids.push_back(vol->getId());
     }
-    for (const auto& part : parts) createPublicVolumeInVm(part);
+    for (const auto& id : ids) {
+        LOG(INFO) << id << ": a protected VM place is free, made again for the framework to mount";
+        remakePublicVolume(id, false);
+    }
+}
+
+void Disk::remakePublicVolume(const std::string& id, bool repairFailed) {
+    for (auto it = mVolumes.begin(); it != mVolumes.end(); ++it) {
+        if ((*it)->getId() != id || (*it)->getType() != VolumeBase::Type::kPublic) continue;
+        auto pub = std::static_pointer_cast<PublicVolume>(*it);
+        const fsvm::Part part = pub->partInVm();
+        pub->destroy();
+        mVolumes.erase(it);
+        if (mPublicVolumes > 0) mPublicVolumes--;
+        createPublicVolumeInVm(part, repairFailed);
+        return;
+    }
 }
 
 /* Disks whose probe was put off, by ID: one pending retry each, however often the device comes back. Only touched
@@ -412,8 +512,20 @@ void Disk::recheckAfterFormat() {
     ScheduleReprobe(getId(), 3, Reprobe::kAfterFormat);
 }
 
-void Disk::noteMounted() {
+void Disk::noteMounted(const std::string& volumeId) {
     mMountRetries = 0;
+    // Mounted again: what it holds can be seen, and it may be formatted as any other volume.
+    mNotWrittenBack.erase(volumeId);
+}
+
+void Disk::noteNotWrittenBack(const std::string& volumeId) {
+    // Kept for this medium whatever the volume's state becomes (a retry that fails, a vold reset, a new read of the
+    // table): its last writes did not reach the medium, and nothing erases it until it mounted again.
+    mNotWrittenBack.insert(volumeId);
+}
+
+bool Disk::notWrittenBack(const std::string& volumeId) const {
+    return mNotWrittenBack.count(volumeId) > 0;
 }
 
 status_t Disk::readPartitionsInVm(int maxMinors) {
@@ -427,7 +539,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     mForceProbe = false;
     const bool confirming = mConfirmProbe;
     mConfirmProbe = false;
-    switch (mProbe.next(seq, mSize, BootMs(), forced, mJustPartitioned, mProbeFailed)) {
+    switch (mProbe.next(seq, mSize, fsvm::NowMs(), forced, mJustPartitioned, mProbeFailed)) {
         case fsvm::ProbeMemory::Next::kRead:
             break;
         case fsvm::ProbeMemory::Next::kSkip:
@@ -452,7 +564,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
             return OK;
     }
     // Another medium than the one the volumes were made for: nothing of theirs may reach it (dropOldMedium).
-    const bool newMedium = mProbe.took(seq, mSize, BootMs());
+    const bool newMedium = mProbe.took(seq, mSize, fsvm::NowMs());
 
     // Fail closed: a kernel that reads this disk's table itself gets no volume served from it.
     // The compile-time CONFIG_BLK_NO_EXTERNAL_PART_SCAN option requires built-in SD and MMC block drivers.
@@ -464,7 +576,11 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
                    << "(CONFIG_BLK_NO_EXTERNAL_PART_SCAN is missing), not serving it";
     }
 
-    if (newMedium) dropOldMedium();
+    if (newMedium) {
+        dropOldMedium();
+        // Another medium: what the old one's volumes did not write back concerns that one only.
+        mNotWrittenBack.clear();
+    }
     destroyAllVolumes();
     mPublicVolumes = 0;
     // Ranges left from before (vold restarted, the medium changed) go before the disk is read again, and those of
@@ -485,7 +601,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
     // time. A disk over the limit shows as one that could not be opened, and is read when a probe is free again.
     // A format the user asked for is not put off.
     int64_t waitMs = 0;
-    if (!kernelScans && !mJustPartitioned && !confirming && !fsvm::TakeProbe(BootMs(), &waitMs)) {
+    if (!kernelScans && !mJustPartitioned && !confirming && !fsvm::TakeProbe(fsvm::NowMs(), &waitMs)) {
         LOG(WARNING) << mId << ": too many disks were read lately, reading this one in " << waitMs << " ms";
         fsvm::DeleteAllPartitions(mDevPath, mSysPath);
         createUnopenableVolume();
@@ -582,7 +698,7 @@ status_t Disk::readPartitionsInVm(int maxMinors) {
                 case fsvm::Part::Class::kExpand:
                     // This phone's adoptable storage that could not be added must not look unsupported (and
                     // offered for formatting): it shows as a card that could not be opened.
-                    if (!createPrivateVolumeInVm(part)) createUnopenableVolume();
+                    if (!createPrivateVolumeInVm(part, maxMinors)) createUnopenableVolume();
                     break;
                 case fsvm::Part::Class::kMeta:
                     break;

@@ -42,8 +42,6 @@ static constexpr int kVmEndMs = 10000;
 static constexpr int kStartMs = 3000;
 static constexpr int kFormatTimeoutMs = 45000;
 
-int64_t NowMs();
-
 /*
  * Has a free slot's fsvmd service run fsvmd with `args` and exactly the descriptors given as 3, 4 and 5 (-1: none),
  * once there is room for its VM of `mib` MiB (0: the size its kind takes). Returns its pid, or -1 with errno set

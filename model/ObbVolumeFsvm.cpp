@@ -30,7 +30,6 @@
 #include <android-base/unique_fd.h>
 #include <cutils/fs.h>
 #include <private/android_filesystem_config.h>
-#include <utils/Timers.h>
 
 #include <fcntl.h>
 #include <linux/openat2.h>
@@ -66,10 +65,6 @@ static constexpr int64_t kObbStartWindowMs = 10000;
 /* How long opening an OBB on a card may take: the card's own fsvmd answers it, and vold holds its lock. */
 static constexpr int kCardOpenMs = 8000;
 static constexpr uint64_t kMaxObbBytes = 8ULL << 30;
-
-static int64_t BootMs() {
-    return systemTime(SYSTEM_TIME_BOOTTIME) / 1000000;
-}
 
 /* "Android" and "obb" as the server's check takes them: in any case. */
 static bool IsObbDir(const std::vector<std::string>& p, size_t at) {
@@ -190,7 +185,7 @@ status_t ObbVolume::mountInVm() {
         return -EBUSY;
     }
     auto& starts = sObbStartsMs[mOwnerGid];
-    const int64_t now = BootMs();
+    const int64_t now = fsvm::NowMs();
     starts.erase(std::remove_if(starts.begin(), starts.end(),
                                 [&](int64_t t) { return now - t >= kObbStartWindowMs; }),
                  starts.end());

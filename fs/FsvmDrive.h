@@ -117,11 +117,15 @@ class Drive {
     /*
      * Serves partition `p` through FUSE at `target` from the drive's VM, as Mount does for a volume of its own.
      * Returns OK once it is served, with the ID its Watch callbacks name in `serving` and whether it is served
-     * read-only. -EAGAIN when there is no room or no slot for the drive's VM (the volume waits), -EIO otherwise, and
-     * nothing stays mounted.
+     * read-only. `readOnly` (a repair of it failed), or a drive opened read-only (its write-protect switch), is
+     * read-only for good: FUSE is mounted read-only, fsvmd is asked for it, and it is reported read-only whatever
+     * fsvmd answers. -EAGAIN when there is no room or no slot for the drive's VM (the volume waits), -EIO otherwise,
+     * and nothing stays mounted.
      */
     status_t attach(const Part& p, gid_t gid, uid_t ownerUid, const std::string& volumeId, const std::string& target,
-                    pid_t* serving, bool* servedReadOnly);
+                    bool readOnly, pid_t* serving, bool* servedReadOnly);
+    /* Whether the drive's disk opened read-only (its write-protect switch) when its VM started */
+    bool readOnly() const { return mReadOnly; }
     /*
      * The partition's FUSE mount went (or a mount failed): it is written back and unmounted in the VM (`orderly`), or
      * ended at once. 0, kExitNotWrittenBack, or -1 when the drive's fsvmd had ended. The VM ends with the last one.
@@ -171,6 +175,7 @@ class Drive {
     std::vector<std::pair<std::string, std::string>> mRanges;
     std::vector<std::string> mNodes;
     uint64_t mDiskBytes = 0;
+    bool mReadOnly = false;
     pid_t mPid = -1;
     DriveControl mControl;
     std::set<int> mAttached;

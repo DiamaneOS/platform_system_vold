@@ -33,6 +33,8 @@
     const fsvm::Part& partInVm() const { return mPart; }
     /* The disk's medium changed under the volume: its fsvmd goes now, without writing back */
     void dropMedium();
+    /* A repair of this volume failed or could not start (Disk::remakePublicVolume): read-only for good */
+    void markRepairFailed() { mRepairFailed = true; }
 
   protected:
     bool mountFailedInVm() const override { return mVmFailed; }
@@ -61,6 +63,12 @@
      */
     pid_t startRepairInVm(pid_t servingPid);
     void endRepairInVm(pid_t repairPid, int rc);
+    /* After a repair, or one that could not start: the volume is made again for the framework to mount */
+    void remakeAfterRepair(bool failed);
+    /* Mounted read-only, and never writable until it is made again: a failed repair, a write-protected drive */
+    bool readOnlyForGood() const;
+    /* Its last writes did not reach the medium: its disk keeps that for the medium (Disk::noteNotWrittenBack) */
+    void noteNotWrittenBack();
     bool cancelRepairInVm() override;
     /*
      * doUnmount's part: fsvmd stops on every way out, also when unmounting FUSE fails. A stuck fsvmd (its VM hangs,
