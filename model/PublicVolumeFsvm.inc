@@ -50,7 +50,7 @@
     /* The steps of doMount around the filesystem VM */
     status_t checkInVm();
     status_t mountInVm(gid_t gid);
-    status_t serveInVm(gid_t gid, bool* servedReadOnly);
+    status_t serveInVm(gid_t gid, bool* servedReadOnly, bool* checking);
     int guardMs() const;
     status_t formatInVm(const std::string& fsType);
     /*
@@ -97,7 +97,7 @@
     /* What fsvmd's Watch callbacks name while the volume is served (fsvmd's pid, or the drive's ID for it), or 0 */
     pid_t mServing = 0;
     /* Serves the partition from its drive's VM */
-    status_t serveOnDrive(gid_t gid, bool* servedReadOnly);
+    status_t serveOnDrive(gid_t gid, bool* servedReadOnly, bool* checking);
     /* The last stop of fsvmd could not write the volume back (state kNotWrittenBack) */
     bool mWriteBackFailed = false;
     /* When the current mount began (fsvm, NowMs), for the deadline of the steps after the VM served it */

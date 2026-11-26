@@ -568,6 +568,13 @@ bool OffersFormat(const Layout& l) {
     return !usable;
 }
 
+bool OffersFormatOnScan(bool probeFailed, const Layout& l, bool anyVolume) {
+    for (const auto& p : l.parts) {
+        if (p.cls == Part::Class::kExpand) return false;
+    }
+    return !probeFailed && OffersFormat(l) && !anyVolume;
+}
+
 bool SameLayout(const Layout& a, const Layout& b) {
     if (a.diskSeq != b.diskSeq || a.diskBytes != b.diskBytes) return false;
     if (a.table != b.table || a.parts.size() != b.parts.size()) return false;
@@ -703,8 +710,9 @@ status_t MountFuse(const std::string& target, gid_t gid, bool readOnly, unique_f
     return OK;
 }
 
-status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
+status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly, bool* checking) {
     if (servedReadOnly) *servedReadOnly = false;
+    if (checking) *checking = false;
     *pid = -1;
     if (!v.obb && sServing >= kMaxServing) {
         // Every slot serves a volume: the volume waits for one (a place), it did not fail.
@@ -755,6 +763,7 @@ status_t Mount(Volume&& v, pid_t* pid, bool* servedReadOnly) {
         // W or F on the same pipe (fsvmd main.rs). Both are reported read-only: apps would get EROFS from a volume
         // reported writable.
         if (servedReadOnly) *servedReadOnly = v.readOnly || c == 'r' || c == 'c';
+        if (checking) *checking = !v.readOnly && c == 'c';
         LOG(INFO) << "fsvm: " << v.volumeId << " served by the filesystem VM, fsvmd pid " << child
                   << (c == 'c' ? ", read-only while the VM checks it" : "");
         *pid = child;

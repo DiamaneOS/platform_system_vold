@@ -544,9 +544,11 @@ void Drive::requestWriteBack() {
 }
 
 status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::string& volumeId,
-                       const std::string& target, bool readOnly, pid_t* serving, bool* servedReadOnly) {
+                       const std::string& target, bool readOnly, pid_t* serving, bool* servedReadOnly,
+                       bool* checking) {
     *serving = 0;
     if (servedReadOnly) *servedReadOnly = false;
+    if (checking) *checking = false;
     const int k = indexOf(p);
     if (k < 0 || mAttached.count(k) || (p.fsType != "vfat" && p.fsType != "exfat")) {
         LOG(ERROR) << "fsvm: " << volumeId << " is not a partition its drive's VM can serve now";
@@ -597,6 +599,7 @@ status_t Drive::attach(const Part& p, gid_t gid, uid_t ownerUid, const std::stri
         // r and c: served read-only, by the VM or while it checks the partition, then W or F (Watch). R: as asked,
         // which is read-only when it was asked so.
         if (servedReadOnly) *servedReadOnly = fixedReadOnly || c == 'r' || c == 'c';
+        if (checking) *checking = !fixedReadOnly && c == 'c';
         *serving = sNextServing--;
         if (conn) mFuseConn[k] = conn;
         LOG(INFO) << "fsvm: " << volumeId << " served by its drive's VM, disk " << k

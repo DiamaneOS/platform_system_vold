@@ -42,6 +42,9 @@
     void setReportReadOnly(bool readOnly) { mReportReadOnly = readOnly; }
     /* The same for a volume mounted already: the framework hears of it at once */
     void announceReadOnly(bool readOnly);
+    /* Whether the VM checks the read-only volume now, so a check may still make it writable: the framework hears of it
+     * at every mount and when it changes, before the state it goes with */
+    void announceCheckPending(bool pending);
     /* After an unmount, reports the volume as not opened */
     void setUnopenable();
     /* A repair without apps (PublicVolume): the volume shows as checking, as stock's check before the mount, then
@@ -54,6 +57,8 @@
   private:
     /* See setReportReadOnly */
     bool mReportReadOnly = false;
+    /* See announceCheckPending */
+    bool mCheckPending = false;
     /* The state the framework hears: a volume the filesystem VM served read-only stays kMounted inside vold, and the
      * framework sees it as mounted read-only */
     State reportedState() const;

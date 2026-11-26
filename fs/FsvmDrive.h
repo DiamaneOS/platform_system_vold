@@ -117,13 +117,13 @@ class Drive {
     /*
      * Serves partition `p` through FUSE at `target` from the drive's VM, as Mount does for a volume of its own.
      * Returns OK once it is served, with the ID its Watch callbacks name in `serving` and whether it is served
-     * read-only. `readOnly` (a repair of it failed), or a drive opened read-only (its write-protect switch), is
-     * read-only for good: FUSE is mounted read-only, fsvmd is asked for it, and it is reported read-only whatever
-     * fsvmd answers. -EAGAIN when there is no room or no slot for the drive's VM (the volume waits), -EIO otherwise,
+     * read-only, and in `checking` whether only while the VM checks it. `readOnly` (a repair of it failed), or a drive
+     * opened read-only (its write-protect switch), is read-only for good: FUSE is mounted read-only, fsvmd is asked for
+     * it, and it is reported read-only whatever fsvmd answers. -EAGAIN when there is no room or no slot for the drive's VM (the volume waits), -EIO otherwise,
      * and nothing stays mounted.
      */
     status_t attach(const Part& p, gid_t gid, uid_t ownerUid, const std::string& volumeId, const std::string& target,
-                    bool readOnly, pid_t* serving, bool* servedReadOnly);
+                    bool readOnly, pid_t* serving, bool* servedReadOnly, bool* checking = nullptr);
     /* Whether the drive's disk opened read-only (its write-protect switch) when its VM started */
     bool readOnly() const { return mReadOnly; }
     /*
