@@ -526,7 +526,9 @@ TEST(FsvmTest, AdmissionSizesAsFsvmd) {
     EXPECT_EQ(96u, ObbVmMib((2ULL << 30) + 512));
     // Every VM of vold's fits beside the decode service's VM: 512 MiB pool, 298 MiB of it the decode VM's, 10 for
     // this VM's firmware region and bounce buffers.
-    EXPECT_EQ(204u, RepairVmMib("vfat", 0));
+    EXPECT_EQ(96u, RepairVmMib("vfat", 0));
+    EXPECT_EQ(204u, RepairVmMib("exfat", 0));
+    EXPECT_EQ(204u, RepairVmMib("", 0));
     EXPECT_EQ(144u, RepairVmMib("vfat", 64 << 20));
     EXPECT_EQ(96u, RepairVmMib("vfat", 1 << 20));
     EXPECT_EQ(145u, RepairVmMib("exfat", 65 << 20));

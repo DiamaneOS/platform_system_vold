@@ -171,6 +171,8 @@ uint64_t ObbVmMib(uint64_t diskBytes) {
 }
 
 uint64_t RepairVmMib(const std::string& fsType, uint64_t metaBytes) {
+    // FAT with unknown metadata size already ran its read-only check in the smallest serving VM.
+    if (fsType == "vfat" && metaBytes == 0) return kServeVmMib;
     // fsvmd main.rs repair_memory_mib: the volume's serving VM, or the largest one without its metadata size.
     if (metaBytes == 0) return kMaxVmMiB;
     const uint64_t meta = std::min<uint64_t>((metaBytes >> 20) + ((metaBytes & ((1 << 20) - 1)) != 0), 1 << 20);
