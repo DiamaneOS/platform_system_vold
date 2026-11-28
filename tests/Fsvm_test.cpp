@@ -23,6 +23,7 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <thread>
 
 #include "../fs/Fsvm.h"
@@ -534,6 +535,28 @@ TEST(FsvmTest, AdmissionSizesAsFsvmd) {
     EXPECT_EQ(145u, RepairVmMib("exfat", 65 << 20));
     EXPECT_EQ(204u, RepairVmMib("exfat", UINT64_MAX));
     EXPECT_EQ(204u, RepairVmMib("vfat", UINT64_MAX));
+}
+
+// A repair's VM is admitted by the size fsvmd starts it with, which vold names: the first one, or after
+// kExitRepairLarger the largest, which RoomFor admits (and an OBB image's VM may stop for) before it starts.
+TEST(FsvmTest, RepairStartsInTheAdmittedVm) {
+    Volume v;
+    v.volumeId = "public:8,1";
+    v.gid = 1023;
+    v.diskBytes = 1ULL << 30;
+    v.blockSize = 512;
+    v.part.length = v.diskBytes / 512;
+    v.part.fsType = "vfat";
+    for (uint64_t mib : {RepairVmMib("vfat", 0), kMaxRepairVmMib}) {
+        std::vector<std::string> args = RepairArgs(v, mib);
+        auto it = std::find(args.begin(), args.end(), "--repair-mib");
+        ASSERT_NE(args.end(), it);
+        ASSERT_NE(args.end(), it + 1);
+        EXPECT_EQ(std::to_string(mib), *(it + 1));
+    }
+    EXPECT_EQ(96u, RepairVmMib("vfat", 0));
+    EXPECT_EQ(204u, kMaxRepairVmMib);
+    EXPECT_EQ(6, kExitRepairLarger);
 }
 
 // H4: a partition's ID and node come only from the disk's own minors, and a node left for another device goes.

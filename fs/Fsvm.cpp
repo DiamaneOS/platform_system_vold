@@ -163,7 +163,7 @@ static constexpr uint64_t kVmExtraMiB = 4 + 6;
 /* fsvmd's largest VM (fsvm proto layout.rs MAX_SERVE_MIB): the largest that starts beside the decode service's VM in
  * the pool. Its smallest are kProbeVmMib and kServeVmMib (PROBE_MIB and MIN_SERVE_MIB): a volume's VM may be larger,
  * and falls back to the smallest serving VM when that does not start. */
-static constexpr uint64_t kMaxVmMiB = 204;
+static constexpr uint64_t kMaxVmMiB = kMaxRepairVmMib;
 
 uint64_t ObbVmMib(uint64_t diskBytes) {
     // fsvmd main.rs obb_memory_mib: the probe VM's size up to 2 GiB, a serving VM's least above.
@@ -857,20 +857,26 @@ void Kill(pid_t pid) {
     LOG(WARNING) << "fsvm: fsvmd " << pid << " killed without writing back";
 }
 
-pid_t StartRepair(Volume&& v) {
+std::vector<std::string> RepairArgs(const Volume& v, uint64_t mib) {
+    return {"--repair", "--volume", v.volumeId, "--gid", std::to_string(v.gid),
+            "--disk-bytes", std::to_string(v.diskBytes), "--block-size",
+            std::to_string(v.blockSize), "--partition", std::to_string(v.part.index),
+            "--start", std::to_string(v.part.start), "--length", std::to_string(v.part.length),
+            "--fs", v.part.fsType.empty() ? "-" : v.part.fsType,
+            // The repair VM is sized like the volume's serving VM.
+            "--meta-bytes", std::to_string(v.part.metaBytes),
+            // Exactly the size vold admitted: fsvmd asks again rather than start a larger one.
+            "--repair-mib", std::to_string(mib)};
+}
+
+pid_t StartRepair(Volume&& v, bool largest) {
     int p[2];
     if (pipe2(p, O_CLOEXEC)) return -1;
     unique_fd rd(p[0]), wr(p[1]);
-    // On a volume slot: a repair may take long, and the probe slot stays free for other disks.
-    std::vector<std::string> args = {"--repair", "--volume", v.volumeId, "--gid", std::to_string(v.gid),
-                                     "--disk-bytes", std::to_string(v.diskBytes), "--block-size",
-                                     std::to_string(v.blockSize), "--partition", std::to_string(v.part.index),
-                                     "--start", std::to_string(v.part.start), "--length", std::to_string(v.part.length),
-                                     "--fs", v.part.fsType.empty() ? "-" : v.part.fsType,
-                                     // The repair VM is sized like the volume's serving VM.
-                                     "--meta-bytes", std::to_string(v.part.metaBytes)};
-    // Admitted by the size fsvmd gives the repair's first VM.
-    pid_t pid = Spawn(args, v.fd.get(), -1, wr.get(), RepairVmMib(v.part.fsType, v.part.metaBytes));
+    // On a volume slot: a repair may take long, and the probe slot stays free for other disks. Admitted by the size
+    // of its VM (Spawn, RoomFor): the first one fsvmd would give it, or the largest after kExitRepairLarger.
+    const uint64_t mib = largest ? kMaxRepairVmMib : RepairVmMib(v.part.fsType, v.part.metaBytes);
+    pid_t pid = Spawn(RepairArgs(v, mib), v.fd.get(), -1, wr.get(), mib);
     if (pid <= 0) {
         LOG(ERROR) << "fsvm: no fsvmd for the repair of " << v.volumeId;
         return -1;

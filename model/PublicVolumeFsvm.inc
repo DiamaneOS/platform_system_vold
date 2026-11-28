@@ -81,6 +81,9 @@
      * read-only, with its notice, from the next check on.
      */
     pid_t startRepairInVm(pid_t servingPid);
+    /* The repair `repairPid` ended with fsvm::kExitRepairLarger: it starts again in the largest VM vold admits. */
+    pid_t repairLargerInVm(pid_t repairPid);
+    pid_t startOwnRepairInVm(bool largest);
     void endRepairInVm(pid_t repairPid, int rc);
     /* After a repair, or one that could not start: the volume is made again for the framework to mount */
     void remakeAfterRepair(bool failed);
