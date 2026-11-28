@@ -33,10 +33,12 @@ class RangeHolds {
                    (held.start <= p.start ? p.start - held.start < held.length : held.start - p.start < p.length);
         });
     }
+    // The hold of the same range goes: one of the same generation, and one recorded without a generation, which
+    // count() takes for every generation. An unknown generation never releases a known one.
     void erase(const Part& p) {
-        if (p.diskSeq.empty()) return;
         mParts.erase(std::remove_if(mParts.begin(), mParts.end(), [&](const Part& held) {
-            return held.diskSeq == p.diskSeq && held.start == p.start && held.length == p.length;
+            return (held.diskSeq.empty() || held.diskSeq == p.diskSeq) && held.start == p.start &&
+                   held.length == p.length;
         }), mParts.end());
     }
     void clear() { mParts.clear(); }

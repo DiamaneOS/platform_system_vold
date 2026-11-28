@@ -28,6 +28,7 @@
 
 #include "../fs/Fsvm.h"
 #include "../fs/FsvmDrive.h"
+#include "../fs/FsvmRangeHolds.h"
 #include "../model/Disk.h"
 #include "../model/PublicVolume.h"
 
@@ -557,6 +558,34 @@ TEST(FsvmTest, RepairStartsInTheAdmittedVm) {
     EXPECT_EQ(96u, RepairVmMib("vfat", 0));
     EXPECT_EQ(204u, kMaxRepairVmMib);
     EXPECT_EQ(6, kExitRepairLarger);
+}
+
+// A hold recorded without a disk generation holds every generation of its range, and the range's recovery releases
+// it. A recovery of an unknown generation releases only such a hold, never one of a known generation.
+TEST(FsvmTest, WildcardRangeHoldIsReleased) {
+    RangeHolds holds;
+    Part any, known, other;
+    any.start = known.start = other.start = 2048;
+    any.length = known.length = other.length = 4096;
+    known.diskSeq = "41";
+    other.diskSeq = "42";
+    holds.insert(any);
+    ASSERT_TRUE(holds.count(known));
+    holds.erase(known);
+    EXPECT_FALSE(holds.count(known));
+    EXPECT_FALSE(holds.count(other));
+    holds.insert(any);
+    holds.erase(any);
+    EXPECT_FALSE(holds.count(known));
+    holds.insert(known);
+    holds.erase(any);
+    EXPECT_TRUE(holds.count(known));
+    holds.erase(other);
+    EXPECT_TRUE(holds.count(known));
+    Part resized = known;
+    resized.length = 8192;
+    holds.erase(resized);
+    EXPECT_TRUE(holds.count(known));
 }
 
 // H4: a partition's ID and node come only from the disk's own minors, and a node left for another device goes.
