@@ -45,6 +45,9 @@ using android::base::StringPrintf;
 namespace android {
 namespace vold {
 
+// A repair that needs the largest VM waits this many seconds at most for room for it, one look a second.
+static constexpr int kRepairRoomWaits = 30;
+
 PublicVolume::PublicVolume(dev_t diskDevice, const std::string& diskDevPath, const std::string& diskSysPath,
                            uint64_t diskBytes, const fsvm::Part& part, std::shared_ptr<fsvm::Drive> drive)
     : VolumeBase(Type::kPublic), mDevice(diskDevice) {
@@ -108,6 +111,17 @@ pid_t PublicVolume::startRepairInVm(pid_t serving) {
     // A volume on a partition device of its own (a virtual disk): in a VM of its own, which sees it as a whole disk.
     unmount();
     showChecking();
+    return startOwnRepairInVm(false);
+}
+
+pid_t PublicVolume::repairLargerInVm(pid_t repairPid) {
+    // DiamaneOS: the check did not finish in the VM vold admitted (fsvm::kExitRepairLarger): the largest one now.
+    if (repairPid != mRepairPid || mDrive) return -1;
+    mRepairPid = -1;
+    return startOwnRepairInVm(true);
+}
+
+pid_t PublicVolume::startOwnRepairInVm(bool largest) {
     fsvm::Volume v;
     v.fd.reset(TEMP_FAILURE_RETRY(open(mDevPath.c_str(), O_RDWR | O_CLOEXEC)));
     v.blockSize = v.fd >= 0 ? fsvm::BlockSize(v.fd.get()) : 0;
@@ -121,7 +135,7 @@ pid_t PublicVolume::startRepairInVm(pid_t serving) {
     v.part.fsType = mFsType;
     v.gid = AID_MEDIA_RW;
     v.volumeId = getId();
-    mRepairPid = fsvm::StartRepair(std::move(v));
+    mRepairPid = fsvm::StartRepair(std::move(v), largest);
     if (mRepairPid <= 0) {
         mRepairPid = -1;
         remakeAfterRepair(true);
@@ -290,6 +304,18 @@ void PublicVolume::onCheckDone(pid_t serving, char state) {
                 lock.unlock();
                 // A drive's repair token is never a pid (fsvm::Drive::startRepair).
                 int rc = repair < 0 ? fsvm::WaitDriveRepair(repair) : fsvm::WaitRepair(repair);
+                if (rc == fsvm::kExitRepairLarger && repair > 0) {
+                    // Room for the largest VM first (an OBB image's VM may stop for it in Spawn), for a while.
+                    for (int i = 0; i < kRepairRoomWaits && !fsvm::RoomForVm(fsvm::kMaxRepairVmMib); i++) sleep(1);
+                    lock.lock();
+                    vol = VolumeManager::Instance()->findVolume(id);
+                    if (!vol || vol->getType() != Type::kPublic) return;
+                    pid_t larger = static_cast<PublicVolume*>(vol.get())->repairLargerInVm(repair);
+                    if (larger == -1) return;
+                    lock.unlock();
+                    repair = larger;
+                    rc = fsvm::WaitRepair(repair);
+                }
                 lock.lock();
                 vol = VolumeManager::Instance()->findVolume(id);
                 if (vol && vol->getType() == Type::kPublic) {

@@ -172,11 +172,17 @@ void Kill(pid_t pid);
 /* fsvmd's exit status when its VM was refused at its start for want of memory: no pool room and the pieces left of
  * the hypervisor's budget too few (fsvmd main.rs EXIT_NO_ROOM) */
 static constexpr int kExitNoRoom = 5;
+/* fsvmd's exit status when a repair's check did not finish in the VM vold admitted: vold admits the largest VM
+ * (kMaxRepairVmMib) and starts the repair again there (fsvmd main.rs EXIT_REPAIR_LARGER) */
+static constexpr int kExitRepairLarger = 6;
+static constexpr uint64_t kMaxRepairVmMib = 204;
 /*
  * Starts a repair of `v` (a card's volume: its range, or the disk for a whole-disk filesystem) in a filesystem VM with
  * no time limit, and returns fsvmd's pid without waiting. Kill stops it at any time.
  */
-pid_t StartRepair(Volume&& v);
+pid_t StartRepair(Volume&& v, bool largest = false);
+/* fsvmd's arguments for the repair of `v` in a VM of `mib` MiB, the size vold admitted it by. */
+std::vector<std::string> RepairArgs(const Volume& v, uint64_t mib);
 /* Waits for repair `pid` to end, without a time limit: never with vold's lock held. 0 when the volume is clean now. */
 int WaitRepair(pid_t pid);
 
